@@ -1510,7 +1510,8 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                                preload_topk=0, cache_gb=20.0, profile=False,
                                use_pread=False, pread_index=None, pread_fds=None,
                                use_cext=False, batch_experts=False,
-                               top_k_override=0, no_expert_cache=False):
+                               top_k_override=0, no_expert_cache=False,
+                               pin_experts=0, pin_topk=51):
     """Generate tokens with selective expert loading for MoE models.
 
     At startup: pre-load all non-expert weights (~2.3GB) for all layers into DRAM.
@@ -1672,6 +1673,22 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         })
         prof_token_count = 0  # tokens profiled (excludes prompt token 0)
 
+    # === Online expert pinning state ===
+    # When pin_experts > 0, we track expert activations during warmup, then pin the
+    # top-K most frequently used experts per layer as persistent mx.arrays in GPU memory.
+    # Pinned experts skip disk I/O entirely — they're already materialized in Metal.
+    pinned_experts = {}  # {layer_idx: {expert_idx: {(proj, attr): mx.array}}}
+    pin_counts = None  # [num_layers, num_experts] activation counter (during warmup)
+    pin_phase = "disabled"  # "disabled" | "warmup" | "active"
+    pin_total_hits = 0
+    pin_total_lookups = 0
+    if pin_experts > 0:
+        num_experts_total = lm.args.num_experts
+        pin_counts = np.zeros((num_layers, num_experts_total), dtype=np.int32)
+        pin_phase = "warmup"
+        print(f"  [pin] Online expert pinning enabled: warmup={pin_experts} tokens, "
+              f"topk={pin_topk}/layer, num_experts={num_experts_total}")
+
     for token_idx in range(max_tokens):
         t_token_start = time.perf_counter() if profile else time.time()
 
@@ -1681,6 +1698,9 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         token_io_time = 0.0
         token_array_time = 0.0
         token_moe_compute_time = 0.0
+        # Reset per-token pin I/O miss counter
+        if pin_phase == "active":
+            generate_offload_selective._last_io_misses = 0
 
         # --- Embed ---
         h = text_model.embed_tokens(input_ids)
@@ -1781,62 +1801,93 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             for name, filepath in expert_entries:
                 expert_file_map[name] = filepath
 
+            # --- Online expert pinning: track activations during warmup ---
+            if pin_phase == "warmup":
+                for eidx in unique_list:
+                    pin_counts[i, eidx] += 1
+
             # --- Expert loading: no-cache path vs LRU cache path ---
             if no_expert_cache:
                 # ---- NO-CACHE PATH ----
                 # Read ALL active experts directly from safetensors (mmap).
                 # OS page cache handles caching at the VM level.
+                # When pin_phase == "active", pinned experts skip I/O entirely.
                 if profile:
                     layer_cache_lookup_ms = 0.0  # no cache to look up
                     t_io_start = time.perf_counter()
                     layer_io_bytes = 0
 
-                layer_cache_hits = 0
-                layer_cache_misses = num_unique  # all are "misses" (all read from disk/page-cache)
-
-                # Pre-populate header_cache for all expert files
-                for filepath in set(expert_file_map.values()):
-                    if filepath not in header_cache:
-                        header_cache[filepath] = parse_safetensors_header(filepath)
-
-                # Read ALL unique experts — use packed format if available, else safetensors
-                all_expert_attrs = {}
-                if packed_layout is not None and i in packed_layers:
-                    # PACKED PATH: 1 contiguous pread per expert (1.9x faster)
-                    packed_fd = packed_fds[i]
-                    with ThreadPoolExecutor(max_workers=min(8, num_unique)) as executor:
-                        futures = [
-                            executor.submit(read_expert_packed, packed_fd, packed_layout, eidx)
-                            for eidx in unique_list
-                        ]
-                        for future in futures:
-                            eidx, attrs, io_stats = future.result()
-                            all_expert_attrs[eidx] = attrs
-                            token_io_bytes += io_stats["bytes_read"]
-                            token_io_seeks += io_stats["seek_count"]
-                            token_io_time += io_stats["io_time_s"]
-                            token_array_time += io_stats["array_time_s"]
-                            if profile:
-                                layer_io_bytes += io_stats["bytes_read"]
+                # Split experts into pinned vs unpinned
+                layer_pinned = pinned_experts.get(i, {})
+                if pin_phase == "active" and layer_pinned:
+                    pinned_list = [idx for idx in unique_list if idx in layer_pinned]
+                    unpinned_list = [idx for idx in unique_list if idx not in layer_pinned]
+                    layer_cache_hits = len(pinned_list)
+                    layer_cache_misses = len(unpinned_list)
+                    pin_total_hits += len(pinned_list)
+                    pin_total_lookups += num_unique
                 else:
-                    # SCATTERED PATH: 9 preads per expert from safetensors
-                    with ThreadPoolExecutor(max_workers=min(4, num_unique)) as executor:
-                        futures = [
-                            executor.submit(
-                                _read_single_expert_attrs,
-                                expert_idx, i, expert_file_map, header_cache
-                            )
-                            for expert_idx in unique_list
-                        ]
-                        for future in futures:
-                            eidx, attrs, io_stats = future.result()
-                            all_expert_attrs[eidx] = attrs
-                            token_io_bytes += io_stats["bytes_read"]
-                            token_io_seeks += io_stats["seek_count"]
-                            token_io_time += io_stats["io_time_s"]
-                            token_array_time += io_stats["array_time_s"]
-                            if profile:
-                                layer_io_bytes += io_stats["bytes_read"]
+                    pinned_list = []
+                    unpinned_list = unique_list
+                    layer_cache_hits = 0
+                    layer_cache_misses = num_unique
+
+                # Pinned experts: use pre-loaded weights (no I/O)
+                all_expert_attrs = {}
+                for idx in pinned_list:
+                    all_expert_attrs[idx] = layer_pinned[idx]
+
+                # Unpinned experts: read from disk
+                if unpinned_list:
+                    # Pre-populate header_cache for all expert files
+                    for filepath in set(expert_file_map.values()):
+                        if filepath not in header_cache:
+                            header_cache[filepath] = parse_safetensors_header(filepath)
+
+                    # Read only unpinned experts from disk
+                    if packed_layout is not None and i in packed_layers:
+                        # PACKED PATH: 1 contiguous pread per expert (1.9x faster)
+                        packed_fd = packed_fds[i]
+                        num_unpinned = len(unpinned_list)
+                        with ThreadPoolExecutor(max_workers=min(8, num_unpinned)) as executor:
+                            futures = [
+                                executor.submit(read_expert_packed, packed_fd, packed_layout, eidx)
+                                for eidx in unpinned_list
+                            ]
+                            for future in futures:
+                                eidx, attrs, io_stats = future.result()
+                                all_expert_attrs[eidx] = attrs
+                                token_io_bytes += io_stats["bytes_read"]
+                                token_io_seeks += io_stats["seek_count"]
+                                token_io_time += io_stats["io_time_s"]
+                                token_array_time += io_stats["array_time_s"]
+                                if profile:
+                                    layer_io_bytes += io_stats["bytes_read"]
+                    else:
+                        # SCATTERED PATH: 9 preads per expert from safetensors
+                        num_unpinned = len(unpinned_list)
+                        with ThreadPoolExecutor(max_workers=min(4, num_unpinned)) as executor:
+                            futures = [
+                                executor.submit(
+                                    _read_single_expert_attrs,
+                                    expert_idx, i, expert_file_map, header_cache
+                                )
+                                for expert_idx in unpinned_list
+                            ]
+                            for future in futures:
+                                eidx, attrs, io_stats = future.result()
+                                all_expert_attrs[eidx] = attrs
+                                token_io_bytes += io_stats["bytes_read"]
+                                token_io_seeks += io_stats["seek_count"]
+                                token_io_time += io_stats["io_time_s"]
+                                token_array_time += io_stats["array_time_s"]
+                                if profile:
+                                    layer_io_bytes += io_stats["bytes_read"]
+
+                # Track I/O misses for per-token display
+                if pin_phase == "active":
+                    generate_offload_selective._last_io_misses = getattr(
+                        generate_offload_selective, '_last_io_misses', 0) + len(unpinned_list)
 
                 if profile:
                     t_io_done = time.perf_counter()
@@ -1862,16 +1913,30 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
             else:
                 # ---- LRU CACHE PATH (original) ----
-                # Determine which experts need disk reads
+                # Determine which experts need disk reads.
+                # When pin_phase == "active", pinned experts bypass cache entirely.
                 if profile:
                     t_cache_lookup = time.perf_counter()
 
                 uncached_list = []
                 layer_cache_hits = 0
                 layer_cache_misses = 0
-                # Protect all experts needed for this layer from eviction
-                expert_cache.protect([(i, idx) for idx in unique_list])
-                for idx in unique_list:
+                layer_pinned_c = pinned_experts.get(i, {})
+                pin_active_here = (pin_phase == "active" and len(layer_pinned_c) > 0)
+
+                # Split: pinned experts skip cache, remaining go through LRU cache
+                if pin_active_here:
+                    cache_check_list = [idx for idx in unique_list if idx not in layer_pinned_c]
+                    pinned_hit_list = [idx for idx in unique_list if idx in layer_pinned_c]
+                    layer_cache_hits += len(pinned_hit_list)
+                    pin_total_hits += len(pinned_hit_list)
+                    pin_total_lookups += num_unique
+                else:
+                    cache_check_list = unique_list
+
+                # Protect all non-pinned experts needed for this layer from eviction
+                expert_cache.protect([(i, idx) for idx in cache_check_list])
+                for idx in cache_check_list:
                     if expert_cache.has_expert(i, idx):
                         expert_cache.record_hit()
                         expert_cache.touch(i, idx)
@@ -1968,13 +2033,22 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                     t_io_done = time.perf_counter()
                     layer_io_ms = (t_io_done - t_io_start) * 1000
 
+                # Track I/O misses for per-token display (cache path)
+                if pin_active_here:
+                    generate_offload_selective._last_io_misses = getattr(
+                        generate_offload_selective, '_last_io_misses', 0) + len(uncached_list)
+
                 # Assemble [num_unique, ...] weight tensors into a dict for direct computation
                 expert_tensors = {}
                 for proj_name in ["gate_proj", "up_proj", "down_proj"]:
                     for attr_name in ["weight", "scales", "biases"]:
                         slices = []
                         for idx in unique_list:
-                            arr = expert_cache.get_attr(i, idx, proj_name, attr_name)
+                            # Check pinned first, then cache
+                            if pin_active_here and idx in layer_pinned_c:
+                                arr = layer_pinned_c[idx].get((proj_name, attr_name))
+                            else:
+                                arr = expert_cache.get_attr(i, idx, proj_name, attr_name)
                             if arr is not None:
                                 slices.append(arr)
                             else:
@@ -2167,6 +2241,117 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             "token_time_s": token_time,
         })
 
+        # === Online expert pinning: transition from warmup to active after N tokens ===
+        if pin_phase == "warmup" and (token_idx + 1) == pin_experts:
+            t_pin_start = time.time()
+            print(f"\n  [pin] Warmup complete ({pin_experts} tokens). Analyzing routing patterns...")
+
+            # Compute coverage: what fraction of total activations are covered by top-K?
+            total_activations = pin_counts.sum()
+            coverage_per_layer = []
+            for li in range(num_layers):
+                layer_counts = pin_counts[li]
+                layer_total = layer_counts.sum()
+                if layer_total == 0:
+                    coverage_per_layer.append(0.0)
+                    continue
+                top_indices = np.argsort(layer_counts)[::-1][:pin_topk]
+                top_sum = layer_counts[top_indices].sum()
+                coverage_per_layer.append(top_sum / layer_total)
+            avg_coverage = np.mean(coverage_per_layer) if coverage_per_layer else 0.0
+            print(f"  [pin] Expert coverage: top-{pin_topk}/layer covers "
+                  f"{avg_coverage:.1%} of activations")
+
+            # Estimate memory budget
+            hidden = lm.args.hidden_size
+            intermediate = lm.args.moe_intermediate_size
+            per_expert_bytes = 3 * intermediate * hidden * 9 // 16  # 3 projs x (weight+scales+biases)
+            total_pin_bytes = pin_topk * num_layers * per_expert_bytes
+            total_pin_gb = total_pin_bytes / 1e9
+
+            # Safety check: ensure pinned data fits in memory budget (~30GB max for pinned)
+            max_pin_gb = 30.0
+            actual_topk = pin_topk
+            if total_pin_gb > max_pin_gb:
+                actual_topk = int(max_pin_gb * 1e9 / (num_layers * per_expert_bytes))
+                total_pin_gb = actual_topk * num_layers * per_expert_bytes / 1e9
+                print(f"  [pin] WARNING: {pin_topk} experts/layer = {pin_topk * num_layers * per_expert_bytes / 1e9:.1f} GB "
+                      f"exceeds {max_pin_gb:.0f} GB budget. Reducing to {actual_topk}/layer ({total_pin_gb:.1f} GB)")
+
+            print(f"  [pin] Pinning {actual_topk} experts x {num_layers} layers = "
+                  f"{actual_topk * num_layers} entries ({total_pin_gb:.1f} GB)...")
+
+            # Pre-populate header_cache for expert files
+            for li in range(num_layers):
+                entries_li = weight_index.get(li, [])
+                _, expert_entries_li = split_layer_entries(entries_li)
+                for name, filepath in expert_entries_li:
+                    if filepath not in header_cache:
+                        header_cache[filepath] = parse_safetensors_header(filepath)
+
+            # Pin top-K experts per layer
+            for li in range(num_layers):
+                layer_counts = pin_counts[li]
+                top_indices = np.argsort(layer_counts)[::-1][:actual_topk]
+                # Filter to experts that were actually activated
+                top_indices = [int(idx) for idx in top_indices if layer_counts[idx] > 0]
+
+                if not top_indices:
+                    continue
+
+                t_layer_pin = time.time()
+
+                entries_li = weight_index.get(li, [])
+                _, expert_entries_li = split_layer_entries(entries_li)
+                efm = {name: filepath for name, filepath in expert_entries_li}
+
+                pinned_experts[li] = {}
+
+                if packed_layout is not None and li in packed_layers:
+                    # PACKED PATH: read from packed expert files
+                    packed_fd = packed_fds[li]
+                    with ThreadPoolExecutor(max_workers=min(8, len(top_indices))) as executor:
+                        futures = [
+                            executor.submit(read_expert_packed, packed_fd, packed_layout, eidx)
+                            for eidx in top_indices
+                        ]
+                        for future in futures:
+                            eidx, attrs, _ = future.result()
+                            pinned_experts[li][eidx] = attrs
+                else:
+                    # SCATTERED PATH: read from safetensors
+                    with ThreadPoolExecutor(max_workers=min(8, len(top_indices))) as executor:
+                        futures = [
+                            executor.submit(
+                                _read_single_expert_attrs,
+                                eidx, li, efm, header_cache
+                            )
+                            for eidx in top_indices
+                        ]
+                        for future in futures:
+                            eidx, attrs, _ = future.result()
+                            pinned_experts[li][eidx] = attrs
+
+                # Force-eval pinned arrays to ensure they're in Metal memory
+                for eidx in pinned_experts[li]:
+                    mx.eval(*pinned_experts[li][eidx].values())
+
+                layer_pin_time = time.time() - t_layer_pin
+                if li % 10 == 0 or li == num_layers - 1:
+                    print(f"  [pin] Layer {li}: pinned {len(pinned_experts[li])} experts "
+                          f"({layer_pin_time:.1f}s, mem={get_mem_gb():.1f}GB)")
+
+            total_pin_time = time.time() - t_pin_start
+            actual_pinned = sum(len(v) for v in pinned_experts.values())
+            actual_pin_gb = actual_pinned * per_expert_bytes / 1e9
+            print(f"  [pin] Done. {actual_pinned} experts pinned ({actual_pin_gb:.1f} GB) "
+                  f"in {total_pin_time:.1f}s (mem={get_mem_gb():.1f}GB)")
+
+            pin_phase = "active"
+            # Free the counts array
+            del pin_counts
+            pin_counts = None
+
         # Safety: check system memory pressure every 5 tokens
         if (token_idx + 1) % 5 == 0:
             pressure, free_pct = check_memory_pressure()
@@ -2182,19 +2367,32 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
         cache_hr = expert_cache.hit_rate if expert_cache is not None else 0.0
 
+        # Compute pin hit rate for display
+        pin_hr_str = ""
+        if pin_phase == "active" and pin_total_lookups > 0:
+            pin_hr = pin_total_hits / pin_total_lookups
+            pin_hr_str = f" pin_hr={pin_hr:.0%}"
+        elif pin_phase == "warmup":
+            pin_hr_str = f" pin=warmup({token_idx+1}/{pin_experts})"
+
         if token_idx == 0:
             ttft_ms = token_time * 1000
             print(f"  [{fmt_time(t_token_end - t_start)}] Token 1/{max_tokens}: "
                   f"ttft={ttft_ms:.0f}ms (attn+router={total_attn_router:.0f}ms "
                   f"expert={total_expert:.0f}ms clear={total_clear:.0f}ms "
-                  f"cache_hr={cache_hr:.0%} mem={cur_mem:.1f}GB)")
+                  f"cache_hr={cache_hr:.0%}{pin_hr_str} mem={cur_mem:.1f}GB)")
         elif (token_idx + 1) % 5 == 0 or token_idx == max_tokens - 1:
             elapsed = t_token_end - t_start
             avg_tps = (token_idx + 1) / elapsed
+            # Count I/O misses for pin mode
+            io_miss_str = ""
+            if pin_phase == "active" and pin_total_lookups > 0:
+                # io_misses for this token = unique experts not pinned (tracked per-token below)
+                io_miss_str = f" io_misses={getattr(generate_offload_selective, '_last_io_misses', 0)}"
             print(f"  [{fmt_time(elapsed)}] Token {token_idx+1}/{max_tokens}: "
                   f"{avg_tps:.2f} tok/s (attn+router={total_attn_router:.0f}ms "
                   f"expert={total_expert:.0f}ms clear={total_clear:.0f}ms "
-                  f"cache_hr={cache_hr:.0%} mem={cur_mem:.1f}GB)")
+                  f"cache_hr={cache_hr:.0%}{pin_hr_str}{io_miss_str} mem={cur_mem:.1f}GB)")
 
         # Next iteration input
         input_ids = next_token.reshape(1, 1)
@@ -2235,6 +2433,15 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         if avg_io_ms > 0:
             bw = (avg_bytes / 1024 / 1024) / (avg_io_ms / 1000)
             print(f"  Effective disk BW: {bw:.0f} MB/s")
+
+        # Pin summary
+        if pin_total_lookups > 0:
+            pin_hr_final = pin_total_hits / pin_total_lookups
+            print(f"\n  === Expert Pinning Summary ===")
+            print(f"  Warmup tokens:    {pin_experts}")
+            print(f"  Experts pinned:   {pin_topk}/layer x {num_layers} layers")
+            print(f"  Pin hit rate:     {pin_hr_final:.1%} ({pin_total_hits}/{pin_total_lookups})")
+            print(f"  Pin memory:       {sum(len(v) for v in pinned_experts.values()) * 3 * lm.args.moe_intermediate_size * lm.args.hidden_size * 9 // 16 / 1e9:.1f} GB")
     else:
         avg_bytes = 0
         avg_seeks = 0
@@ -2336,6 +2543,11 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         "avg_io_ms_per_token": avg_io_ms,
         "avg_arr_ms_per_token": avg_arr_ms,
         "avg_moe_compute_ms_per_token": avg_moe_ms,
+        "pin_experts": pin_experts,
+        "pin_topk": pin_topk if pin_experts > 0 else 0,
+        "pin_hit_rate": pin_total_hits / pin_total_lookups if pin_total_lookups > 0 else 0.0,
+        "pin_total_hits": pin_total_hits,
+        "pin_total_lookups": pin_total_lookups,
     }
 
 
@@ -3621,6 +3833,13 @@ def main():
                              "weight access. Reads ALL active experts from mmap'd safetensors per "
                              "token (memcpy from page cache after warmup). Frees ~26GB Metal heap "
                              "for OS page cache, trading per-token read volume for page-cache speed.")
+    parser.add_argument("--pin-experts", type=int, default=0,
+                        help="Online expert pinning: warmup for N tokens tracking routing, then "
+                             "pin the most frequently activated experts in GPU memory. Pinned "
+                             "experts skip disk I/O entirely. 0=disabled (default). Typical: 20.")
+    parser.add_argument("--pin-topk", type=int, default=51,
+                        help="Number of experts to pin per layer after warmup (default: 51, "
+                             "~top 10%% of 512 experts). Higher = more memory, higher hit rate.")
     args = parser.parse_args()
 
     # Validate --cache-gb range
@@ -3635,6 +3854,15 @@ def main():
     if args.preload_topk > 0 and args.mode not in ("offload_selective", "speculative"):
         print(f"WARNING: --preload-topk only works with offload_selective or speculative mode. Ignoring.")
         args.preload_topk = 0
+
+    # Validate --pin-experts is only used with offload_selective
+    if args.pin_experts > 0 and args.mode != "offload_selective":
+        print(f"WARNING: --pin-experts only works with offload_selective mode. Ignoring.")
+        args.pin_experts = 0
+    if args.pin_experts > 0 and args.pin_experts >= args.tokens:
+        print(f"WARNING: --pin-experts ({args.pin_experts}) >= --tokens ({args.tokens}). "
+              f"Need at least 1 token after warmup. Reducing to {args.tokens - 1}.")
+        args.pin_experts = max(1, args.tokens - 1)
 
     t_start = time.time()
     mem_before = get_mem_gb()
@@ -3680,7 +3908,11 @@ def main():
         model, tokenizer = load_model_no_weights(model_path)
         # Cap wired memory — needs non-expert weights (~3-5GB) + expert cache (if used)
         # With --no-expert-cache, no Metal heap for experts; just non-expert + 5GB headroom.
-        if getattr(args, 'no_expert_cache', False) and args.mode == "offload_selective":
+        # With --pin-experts, need extra headroom for pinned expert arrays (~20-30GB).
+        if args.pin_experts > 0 and args.mode == "offload_selective":
+            # Pinned experts need significant GPU memory: non-expert (~5GB) + pinned (~20-30GB)
+            wired_gb = min(args.cache_gb + 8 + 25, args.max_mem_gb * 0.9, 43)
+        elif getattr(args, 'no_expert_cache', False) and args.mode == "offload_selective":
             wired_gb = min(5 + 5, args.max_mem_gb * 0.8, 43)  # non-expert (~5GB) + 5GB headroom
         else:
             wired_gb = min(args.cache_gb + 8, args.max_mem_gb * 0.8, 43)
@@ -3692,6 +3924,8 @@ def main():
             mode_note = " [selective expert loading]"
             if getattr(args, 'no_expert_cache', False):
                 mode_note += " [no-expert-cache]"
+            if args.pin_experts > 0:
+                mode_note += f" [pin-experts={args.pin_experts}, pin-topk={args.pin_topk}]"
         print(f"[{fmt_time(time.time() - t_start)}] Loaded (global weights only). "
               f"wired limit={wired_gb:.0f}GB{mode_note}")
     elif args.mode == "lazy":
@@ -3744,40 +3978,61 @@ def main():
         print(f"[{fmt_time(time.time() - t_start)}] Initializing fast_expert_io C extension...")
         import fast_expert_io
 
-        # Load expert_index.json (same data as pread path)
-        index_path = Path("expert_index.json")
-        if not index_path.exists():
-            index_path = Path(model_path) / "expert_index.json"
-        if not index_path.exists():
-            print("ERROR: expert_index.json not found. Required for --use-cext.")
-            sys.exit(1)
-        with open(index_path) as f:
-            cext_expert_index = json.load(f)
+        # Check for packed_experts/ directory (1 read per expert, much faster)
+        packed_dir = Path(model_path) / "packed_experts"
+        packed_layout_path = packed_dir / "layout.json"
 
-        # Build file_dict: {filename: full_path}
-        shard_files = set()
-        for tensor_info in cext_expert_index["tensors"].values():
-            shard_files.add(tensor_info["file"])
-        for layer_reads in cext_expert_index.get("expert_reads", {}).values():
-            for comp_info in layer_reads.values():
-                shard_files.add(comp_info["file"])
+        if packed_layout_path.exists():
+            # Packed mode: one file per layer, contiguous expert blocks
+            with open(packed_layout_path) as f:
+                packed_layout = json.load(f)
 
-        resolved_model_path = Path(cext_expert_index.get("model_path", str(model_path)))
-        cext_file_dict = {}
-        for filename in sorted(shard_files):
-            filepath = resolved_model_path / filename
-            if not filepath.exists():
-                filepath = Path(model_path) / filename
-            cext_file_dict[filename] = str(filepath)
+            fast_expert_io.init(num_workers=8)
+            fast_expert_io.register_packed_files(str(packed_dir), packed_layout)
+            atexit.register(fast_expert_io.shutdown)
 
-        fast_expert_io.init(num_workers=8)
-        fast_expert_io.register_files(cext_file_dict, cext_expert_index)
-        atexit.register(fast_expert_io.shutdown)
+            num_packed_layers = packed_layout.get("num_layers", 0)
+            num_packed_comps = len(packed_layout.get("components", []))
+            expert_size_mb = packed_layout.get("expert_size", 0) / 1e6
+            print(f"[cext] Packed mode: {num_packed_layers} layers, "
+                  f"{num_packed_comps} components/expert, "
+                  f"{expert_size_mb:.1f} MB/expert, 8 workers")
+            del packed_layout
+        else:
+            # Scattered mode: read from safetensors shards (9 reads per expert)
+            index_path = Path("expert_index.json")
+            if not index_path.exists():
+                index_path = Path(model_path) / "expert_index.json"
+            if not index_path.exists():
+                print("ERROR: expert_index.json not found. Required for --use-cext.")
+                sys.exit(1)
+            with open(index_path) as f:
+                cext_expert_index = json.load(f)
 
-        num_cext_layers = len(cext_expert_index.get("expert_reads", {}))
-        print(f"[cext] Initialized: {num_cext_layers} layers, "
-              f"{len(cext_file_dict)} shard files, 8 workers")
-        del cext_expert_index, cext_file_dict
+            # Build file_dict: {filename: full_path}
+            shard_files = set()
+            for tensor_info in cext_expert_index["tensors"].values():
+                shard_files.add(tensor_info["file"])
+            for layer_reads in cext_expert_index.get("expert_reads", {}).values():
+                for comp_info in layer_reads.values():
+                    shard_files.add(comp_info["file"])
+
+            resolved_model_path = Path(cext_expert_index.get("model_path", str(model_path)))
+            cext_file_dict = {}
+            for filename in sorted(shard_files):
+                filepath = resolved_model_path / filename
+                if not filepath.exists():
+                    filepath = Path(model_path) / filename
+                cext_file_dict[filename] = str(filepath)
+
+            fast_expert_io.init(num_workers=8)
+            fast_expert_io.register_files(cext_file_dict, cext_expert_index)
+            atexit.register(fast_expert_io.shutdown)
+
+            num_cext_layers = len(cext_expert_index.get("expert_reads", {}))
+            print(f"[cext] Scattered mode: {num_cext_layers} layers, "
+                  f"{len(cext_file_dict)} shard files, 8 workers")
+            del cext_expert_index, cext_file_dict
 
     # Generate
     print(f"[{fmt_time(time.time() - t_start)}] Generating {args.tokens} tokens ({args.mode})...")
@@ -3806,7 +4061,9 @@ def main():
                                             use_cext=args.use_cext,
                                             batch_experts=args.batch_experts,
                                             top_k_override=args.top_k,
-                                            no_expert_cache=args.no_expert_cache)
+                                            no_expert_cache=args.no_expert_cache,
+                                            pin_experts=args.pin_experts,
+                                            pin_topk=args.pin_topk)
     elif args.mode in ("offload", "offload_lazy"):
         # Offload mode: explicit per-layer load -> compute -> clear cycle.
         # Only way to run models larger than DRAM without OS thrashing.
