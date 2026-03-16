@@ -16,7 +16,7 @@ import json
 import re
 import os
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 import subprocess
 import psutil
@@ -150,6 +150,63 @@ def read_expert_slices_direct(filepath, tensor_name, expert_indices, header_cach
         return mx.array(np_f32).astype(mx.bfloat16)
     else:
         return mx.array(stacked)
+
+
+class ExpertCache:
+    """LRU cache for expert weight slices keyed by (layer, expert_id).
+
+    Stores per-attribute arrays so that partially-populated entries can be
+    built incrementally (one proj/attr at a time) then read back as a batch.
+
+    Each entry is a dict mapping "proj_name.attr_name" -> mx.array, e.g.
+    {"gate_proj.weight": mx.array(...), "gate_proj.scales": mx.array(...), ...}.
+    """
+
+    def __init__(self, max_entries=256):
+        self.max_entries = max_entries
+        self.cache = OrderedDict()  # (layer_idx, expert_id) -> {attr_key: mx.array}
+        self.hits = 0
+        self.misses = 0
+
+    def get_attr(self, layer_idx, expert_id, proj_name, attr_name):
+        """Return a single cached array or None."""
+        key = (layer_idx, expert_id)
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            entry = self.cache[key]
+            attr_key = f"{proj_name}.{attr_name}"
+            return entry.get(attr_key)
+        return None
+
+    def put_attr(self, layer_idx, expert_id, proj_name, attr_name, array):
+        """Store a single attribute array for an expert."""
+        key = (layer_idx, expert_id)
+        attr_key = f"{proj_name}.{attr_name}"
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            self.cache[key][attr_key] = array
+        else:
+            if len(self.cache) >= self.max_entries:
+                self.cache.popitem(last=False)  # evict LRU
+            self.cache[key] = {attr_key: array}
+
+    def has_expert(self, layer_idx, expert_id):
+        """Check whether all 9 attributes (3 projs x 3 attrs) are cached."""
+        key = (layer_idx, expert_id)
+        if key not in self.cache:
+            return False
+        return len(self.cache[key]) >= 9  # gate/up/down x weight/scales/biases
+
+    def record_hit(self):
+        self.hits += 1
+
+    def record_miss(self):
+        self.misses += 1
+
+    @property
+    def hit_rate(self):
+        total = self.hits + self.misses
+        return self.hits / total if total > 0 else 0.0
 
 
 def get_mem_gb():
@@ -795,6 +852,11 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     preload_time = time.time() - t_preload
     print(f"  Pre-loaded non-expert weights for {num_layers} layers in {preload_time:.1f}s ({get_mem_gb():.1f}GB)")
 
+    # === LRU cache for expert weight slices ===
+    # 768 entries = 48 layers × 8 experts × 2 tokens worth. ~3.8GB max.
+    # Need ≥384 per token to avoid complete eviction each token cycle.
+    expert_cache = ExpertCache(max_entries=768)
+
     for token_idx in range(max_tokens):
         t_token_start = time.time()
 
@@ -861,21 +923,44 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             for name, filepath in expert_entries:
                 expert_file_map[name] = filepath
 
-            # Load only the selected expert slices using DIRECT I/O (no mmap)
+            # --- LRU cache: determine which experts need disk reads ---
+            uncached_list = []
+            for idx in unique_list:
+                if expert_cache.has_expert(i, idx):
+                    expert_cache.record_hit()
+                else:
+                    expert_cache.record_miss()
+                    uncached_list.append(idx)
+
+            # Read only uncached experts from disk
             switch = layer.mlp.switch_mlp
+            if uncached_list:
+                for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+                    prefix = f"language_model.model.layers.{i}.mlp.switch_mlp.{proj_name}"
+                    for attr_name in ["weight", "scales", "biases"]:
+                        full_key = f"{prefix}.{attr_name}"
+                        if full_key not in expert_file_map:
+                            continue
+                        filepath = expert_file_map[full_key]
+                        # Read only uncached experts' byte ranges (no mmap)
+                        fresh = read_expert_slices_direct(filepath, full_key, uncached_list, header_cache)
+                        # fresh is [len(uncached_list), ...] — split and cache individually
+                        for j, uidx in enumerate(uncached_list):
+                            expert_cache.put_attr(i, uidx, proj_name, attr_name, fresh[j])
+
+            # Assemble [num_unique, ...] weight tensors from cache
             for proj_name in ["gate_proj", "up_proj", "down_proj"]:
                 proj = getattr(switch, proj_name)
-                prefix = f"language_model.model.layers.{i}.mlp.switch_mlp.{proj_name}"
                 for attr_name in ["weight", "scales", "biases"]:
-                    full_key = f"{prefix}.{attr_name}"
-                    if full_key not in expert_file_map:
-                        continue
-                    filepath = expert_file_map[full_key]
-                    # Read only the selected experts' byte ranges (no mmap)
-                    sliced = read_expert_slices_direct(filepath, full_key, unique_list, header_cache)
-                    proj[attr_name] = sliced
+                    slices = []
+                    for idx in unique_list:
+                        arr = expert_cache.get_attr(i, idx, proj_name, attr_name)
+                        if arr is not None:
+                            slices.append(arr)
+                    if slices:
+                        proj[attr_name] = mx.stack(slices, axis=0)
 
-            # Force-eval the sliced expert weights
+            # Force-eval the assembled expert weights
             mx.eval(switch.gate_proj.parameters(),
                     switch.up_proj.parameters(),
                     switch.down_proj.parameters())
@@ -946,19 +1031,21 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         total_expert = sum(lt["expert_ms"] for lt in layer_timings)
         total_clear = sum(lt["clear_ms"] for lt in layer_timings)
 
+        cache_hr = expert_cache.hit_rate
+
         if token_idx == 0:
             ttft_ms = token_time * 1000
             print(f"  [{fmt_time(t_token_end - t_start)}] Token 1/{max_tokens}: "
                   f"ttft={ttft_ms:.0f}ms (attn+router={total_attn_router:.0f}ms "
                   f"expert={total_expert:.0f}ms clear={total_clear:.0f}ms "
-                  f"mem={cur_mem:.1f}GB)")
+                  f"cache_hr={cache_hr:.0%} mem={cur_mem:.1f}GB)")
         elif (token_idx + 1) % 5 == 0 or token_idx == max_tokens - 1:
             elapsed = t_token_end - t_start
             avg_tps = (token_idx + 1) / elapsed
             print(f"  [{fmt_time(elapsed)}] Token {token_idx+1}/{max_tokens}: "
                   f"{avg_tps:.2f} tok/s (attn+router={total_attn_router:.0f}ms "
                   f"expert={total_expert:.0f}ms clear={total_clear:.0f}ms "
-                  f"mem={cur_mem:.1f}GB)")
+                  f"cache_hr={cache_hr:.0%} mem={cur_mem:.1f}GB)")
 
         # Next iteration input
         input_ids = next_token.reshape(1, 1)
@@ -1003,6 +1090,10 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         "avg_attn_router_ms_per_token": avg_attn_router,
         "per_layer_load_ms": per_layer_load,
         "per_layer_compute_ms": per_layer_compute,
+        "expert_cache_hits": expert_cache.hits,
+        "expert_cache_misses": expert_cache.misses,
+        "expert_cache_hit_rate": expert_cache.hit_rate,
+        "expert_cache_entries": len(expert_cache.cache),
     }
 
 
