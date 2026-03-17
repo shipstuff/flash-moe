@@ -2567,8 +2567,24 @@ static ExpertLRUCache *expert_cache_new(id<MTLDevice> device, int max_entries) {
     cache->device = device;
     cache->hits = 0;
     cache->misses = 0;
-    printf("[expert_cache] Initialized: max_entries=%d (%.1f GB budget)\n",
-           max_entries, (double)max_entries * EXPERT_SIZE / 1e9);
+    // Pre-allocate ALL Metal buffers at startup (avoids allocation overhead at runtime)
+    double t_prealloc = now_ms();
+    for (int i = 0; i < max_entries; i++) {
+        cache->entries[i].buffer = [device newBufferWithLength:EXPERT_SIZE
+                                                      options:MTLResourceStorageModeShared];
+        cache->entries[i].layer_idx = -1;
+        cache->entries[i].expert_idx = -1;
+        cache->entries[i].last_used = 0;
+        if (!cache->entries[i].buffer) {
+            fprintf(stderr, "WARNING: expert_cache: pre-alloc failed at entry %d\n", i);
+            max_entries = i;
+            cache->max_entries = i;
+            break;
+        }
+    }
+    cache->num_entries = max_entries; // All slots pre-allocated (but empty keys)
+    printf("[expert_cache] Initialized: max_entries=%d (%.1f GB budget), pre-alloc %.0f ms\n",
+           max_entries, (double)max_entries * EXPERT_SIZE / 1e9, now_ms() - t_prealloc);
     return cache;
 }
 
@@ -2603,20 +2619,20 @@ static id<MTLBuffer> expert_cache_lookup(ExpertLRUCache *cache, int layer_idx, i
 static id<MTLBuffer> expert_cache_insert(ExpertLRUCache *cache, int layer_idx, int expert_idx) {
     id<MTLBuffer> buf = nil;
 
-    if (cache->num_entries < cache->max_entries) {
-        // Cache not full: allocate a new Metal buffer
-        buf = [cache->device newBufferWithLength:EXPERT_SIZE
-                                         options:MTLResourceStorageModeShared];
-        if (!buf) {
-            fprintf(stderr, "WARNING: expert_cache: Metal buffer alloc failed at entry %d\n",
-                    cache->num_entries);
-            return nil;
+    // Find a slot: first try an unused slot (layer_idx == -1), then LRU evict
+    int target = -1;
+    for (int i = 0; i < cache->num_entries; i++) {
+        if (cache->entries[i].layer_idx == -1) {
+            target = i;
+            break;
         }
-        int idx = cache->num_entries++;
-        cache->entries[idx].layer_idx = layer_idx;
-        cache->entries[idx].expert_idx = expert_idx;
-        cache->entries[idx].buffer = buf;
-        cache->entries[idx].last_used = ++cache->access_counter;
+    }
+    if (target >= 0) {
+        // Unused pre-allocated slot
+        buf = cache->entries[target].buffer;
+        cache->entries[target].layer_idx = layer_idx;
+        cache->entries[target].expert_idx = expert_idx;
+        cache->entries[target].last_used = ++cache->access_counter;
         return buf;
     }
 
