@@ -222,6 +222,129 @@ static int send_chat_request(int port, const char *user_message, int max_tokens,
     return sock;
 }
 
+// ============================================================================
+// Streaming markdown renderer — stateful ANSI escape code emitter
+// ============================================================================
+// Handles: **bold**, *italic*, `inline code`, ```code blocks```, # headers
+// State persists across token boundaries (e.g. "**" in one token, text in next)
+
+#define ANSI_RESET   "\033[0m"
+#define ANSI_BOLD    "\033[1m"
+#define ANSI_ITALIC  "\033[3m"
+#define ANSI_CODE    "\033[36m"      // cyan for inline code
+#define ANSI_CODEBLK "\033[48;5;236m\033[38;5;252m"  // dark bg + light fg for code blocks
+#define ANSI_HEADER  "\033[1;34m"    // bold blue for headers
+#define ANSI_DIM     "\033[2m"
+
+typedef struct {
+    int bold;        // inside **...**
+    int italic;      // inside *...*
+    int code_inline; // inside `...`
+    int code_block;  // inside ```...```
+    int line_start;  // at start of a new line
+    char pending[8]; // buffered chars for lookahead (e.g., partial "**")
+    int pending_len;
+} MdState;
+
+static MdState g_md = {0, 0, 0, 0, 1, {0}, 0};
+
+static void md_reset(void) {
+    memset(&g_md, 0, sizeof(g_md));
+    g_md.line_start = 1;
+}
+
+static void md_print(const char *text) {
+    for (int i = 0; text[i]; i++) {
+        char c = text[i];
+
+        // Code block toggle: ```
+        if (c == '`' && text[i+1] == '`' && text[i+2] == '`') {
+            if (g_md.code_block) {
+                printf(ANSI_RESET);
+                g_md.code_block = 0;
+            } else {
+                printf(ANSI_CODEBLK);
+                g_md.code_block = 1;
+            }
+            i += 2;
+            // Skip optional language tag on opening
+            if (g_md.code_block) {
+                while (text[i+1] && text[i+1] != '\n') i++;
+            }
+            continue;
+        }
+
+        // Inside code block: print verbatim
+        if (g_md.code_block) {
+            putchar(c);
+            continue;
+        }
+
+        // Inline code toggle: `
+        if (c == '`') {
+            if (g_md.code_inline) {
+                printf(ANSI_RESET);
+                g_md.code_inline = 0;
+            } else {
+                printf(ANSI_CODE);
+                g_md.code_inline = 1;
+            }
+            continue;
+        }
+
+        // Inside inline code: print verbatim
+        if (g_md.code_inline) {
+            putchar(c);
+            continue;
+        }
+
+        // Headers at line start: # ## ###
+        if (g_md.line_start && c == '#') {
+            printf(ANSI_HEADER);
+            while (text[i] == '#') { putchar(text[i]); i++; }
+            // Print rest of header line
+            while (text[i] && text[i] != '\n') { putchar(text[i]); i++; }
+            printf(ANSI_RESET);
+            if (text[i] == '\n') { putchar('\n'); g_md.line_start = 1; }
+            continue;
+        }
+
+        // Bold: **
+        if (c == '*' && text[i+1] == '*') {
+            if (g_md.bold) {
+                printf(ANSI_RESET);
+                g_md.bold = 0;
+            } else {
+                printf(ANSI_BOLD);
+                g_md.bold = 1;
+            }
+            i++;
+            continue;
+        }
+
+        // Italic: single * (but not **)
+        if (c == '*' && text[i+1] != '*') {
+            if (g_md.italic) {
+                printf(ANSI_RESET);
+                g_md.italic = 0;
+            } else {
+                printf(ANSI_ITALIC);
+                g_md.italic = 1;
+            }
+            continue;
+        }
+
+        // Track line starts
+        if (c == '\n') {
+            g_md.line_start = 1;
+        } else {
+            g_md.line_start = 0;
+        }
+
+        putchar(c);
+    }
+}
+
 // Stream SSE response, accumulate text, return malloc'd response string
 static char *stream_response(int sock, int show_thinking) {
     FILE *stream = fdopen(sock, "r");
@@ -229,6 +352,7 @@ static char *stream_response(int sock, int show_thinking) {
 
     int header_done = 0, in_think = 0, tokens = 0;
     double t_start = now_ms(), t_first = 0;
+    md_reset();  // fresh markdown state for each response
 
     char *response = calloc(1, MAX_RESPONSE);
     int resp_len = 0;
@@ -275,12 +399,13 @@ static char *stream_response(int sock, int show_thinking) {
         }
 
         if (in_think && !show_thinking) continue;
-        if (in_think) printf("\033[2m%s\033[0m", decoded);
-        else printf("%s", decoded);
+        if (in_think) printf(ANSI_DIM "%s" ANSI_RESET, decoded);
+        else md_print(decoded);
         fflush(stdout);
     }
     fclose(stream);
 
+    printf(ANSI_RESET);  // ensure no style leaks
     double gen_time = t_first > 0 ? now_ms() - t_first : 0;
     int gen_tokens = tokens > 1 ? tokens - 1 : 0;
     printf("\n\n");
