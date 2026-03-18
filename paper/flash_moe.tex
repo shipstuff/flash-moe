@@ -286,7 +286,7 @@ Third, the final ``Trust OS'' configuration demonstrates that removing \emph{all
 Table~\ref{tab:breakdown} shows the average time budget per layer at the final 2-bit + OS page cache configuration.
 Expert I/O dominates at 48\% of per-layer time, followed by GPU command buffer synchronization (CMD1 wait at 28\%), CMD2 wait at 15\%, and CPU attention at 9\%.
 
-\begin{table}[t]
+\begin{table}[h!]
 \centering
 \caption{Per-layer time breakdown (2-bit, OS page cache). Total: 2.9\,ms/layer $\times$ 60 = 174\,ms/token $\approx$ 5.7\,tok/s.}
 \label{tab:breakdown}
@@ -326,7 +326,7 @@ These statistics explain why application-level caching provides limited benefit:
 
 Table~\ref{tab:rmse} reports the root-mean-square error between dequantized 4-bit and dequantized 2-bit expert weights, averaged across all 512 experts per layer.
 
-\begin{table}[t]
+\begin{table}[h!]
 \centering
 \small
 \caption{2-bit requantization RMSE by projection type, averaged across all experts. Values represent the reconstruction error when dequantizing 2-bit weights vs.\ the original 4-bit dequantized values.}
