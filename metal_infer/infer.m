@@ -78,6 +78,11 @@
 #define RMS_NORM_EPS        1e-6f
 #define NUM_EXPERTS         512
 #define NUM_EXPERTS_PER_TOK 10
+
+// TurboQuant KV-cache compression (TurboMoE)
+#define GPU_TQ_SEQ           GPU_KV_SEQ
+#define TQ_WORDS_PER_HEAD    (HEAD_DIM / 16)   // 16 for 2-bit (16 indices per uint32)
+
 #define MOE_INTERMEDIATE    1024
 #define SHARED_INTERMEDIATE 1024
 #define FULL_ATTN_INTERVAL  4
@@ -124,7 +129,7 @@
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+#define MODEL_PATH_DEFAULT "/Users/carl/models/Qwen3.5-397B-A17B-4bit"
 
 // ============================================================================
 // Timing helper
@@ -155,12 +160,23 @@ typedef struct {
     double spec_route;       // speculative early routing (gate matvec + topK)
     double expert_io;        // parallel pread + cache lookup
     double cmd3_encode;      // CMD3 encode experts + submit (deferred)
+    double tq_kernel_time;  // tq_fused_attention kernel dispatch + wait
     double total;            // total per-layer time
     int count;               // number of layers timed
 } LayerTimingAccum;
 
 static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
+
+// TQ latency histogram: collect per-layer tq_kernel samples for p99.99 analysis
+#define TQ_HIST_MAX 30000
+static float g_tq_samples[TQ_HIST_MAX];
+static int g_tq_sample_count = 0;
+
+// Temporal hedge: race identical tq_fused_attention on a second command queue
+// GPU can overlap both dispatches; effective latency = min(t_dispatch0, t_dispatch1)
+static int g_hedge_enabled = 0;
+static id<MTLCommandQueue> g_hedge_queue1;
 
 // Temporal prediction pipeline counters (declared early for timing_print access)
 static int g_pred_enabled = 0;
@@ -329,6 +345,7 @@ static void cache_telemetry_print(uint64_t hits, uint64_t misses) {
 
 static void timing_reset(void) {
     memset(&g_timing, 0, sizeof(g_timing));
+    g_tq_sample_count = 0;
 }
 
 static void timing_print(void) {
@@ -347,6 +364,7 @@ static void timing_print(void) {
     fprintf(stderr, "  routing_cpu:    %6.3f\n", g_timing.routing_cpu / n);
     fprintf(stderr, "  expert_io:      %6.3f\n", g_timing.expert_io / n);
     fprintf(stderr, "  cmd3_encode:    %6.3f\n", g_timing.cmd3_encode / n);
+    fprintf(stderr, "  tq_kernel_time: %6.3f\n", g_timing.tq_kernel_time / n);
     fprintf(stderr, "  total_layer:    %6.3f\n", g_timing.total / n);
     fprintf(stderr, "  sum_phases:     %6.3f\n",
             (g_timing.deferred_wait + g_timing.deferred_cpu + g_timing.input_norm +
@@ -364,6 +382,37 @@ static void timing_print(void) {
         fprintf(stderr, "  [predict] hits=%llu misses=%llu rate=%.1f%% layers=%llu\n",
                 g_pred_hits, g_pred_misses, hit_rate, g_pred_layers);
     }
+
+    // ---- TQ latency histogram: per-layer samples across all tokens ----
+    if (g_tq_sample_count > 10) {
+        int n = g_tq_sample_count;
+        float *sorted = (float *)malloc(n * sizeof(float));
+        memcpy(sorted, g_tq_samples, n * sizeof(float));
+        // Simple insertion sort (n <= 1920, fast enough)
+        for (int i = 1; i < n; i++) {
+            float key = sorted[i];
+            int j = i - 1;
+            while (j >= 0 && sorted[j] > key) {
+                sorted[j + 1] = sorted[j];
+                j--;
+            }
+            sorted[j + 1] = key;
+        }
+        fprintf(stderr, "\n[tq_histogram] %d samples:\n", n);
+        fprintf(stderr, "  p50:   %.3f ms\n", sorted[(int)(n * 0.50)]);
+        fprintf(stderr, "  p90:   %.3f ms\n", sorted[(int)(n * 0.90)]);
+        fprintf(stderr, "  p99:   %.3f ms\n", sorted[(int)(n * 0.99)]);
+        fprintf(stderr, "  p99.9: %.3f ms\n", sorted[(int)(n * 0.999)]);
+        fprintf(stderr, "  p99.99: %.3f ms\n", sorted[(int)(n * 0.9999)]);
+        fprintf(stderr, "  max:   %.3f ms\n", sorted[n - 1]);
+        float median = sorted[n / 2];
+        int stall = 0;
+        for (int i = 0; i < n; i++) if (g_tq_samples[i] > median * 2) stall++;
+        fprintf(stderr, "  stall_candidates (>2x median): %d / %d (%.2f%%)\n",
+                stall, n, stall * 100.0 / n);
+        free(sorted);
+    }
+    if (g_hedge_enabled) fprintf(stderr, "  [hedge] racing 2 identical tq_fused_attention dispatches\n");
 }
 
 // ============================================================================
@@ -960,6 +1009,24 @@ typedef struct {
     id<MTLBuffer> buf_attn_scores;  // [NUM_ATTN_HEADS * MAX_SEQ_LEN floats] all heads' scores
     id<MTLBuffer> buf_attn_out;     // [NUM_ATTN_HEADS * HEAD_DIM floats] full attention output
     id<MTLBuffer> buf_attn_gate;    // [NUM_ATTN_HEADS * HEAD_DIM floats] sigmoid gate
+
+    // TurboQuant KV-cache compression (TurboMoE)
+    id<MTLBuffer> buf_tq_k_packed[NUM_FULL_ATTN_LAYERS]; // [GPU_TQ_SEQ, NUM_KV_HEADS, TQ_WORDS_PER_HEAD] uint32
+    id<MTLBuffer> buf_tq_k_norms[NUM_FULL_ATTN_LAYERS];  // [GPU_TQ_SEQ, NUM_KV_HEADS] float32
+    id<MTLBuffer> buf_tq_v_packed[NUM_FULL_ATTN_LAYERS]; // [GPU_TQ_SEQ, NUM_KV_HEADS, TQ_WORDS_PER_HEAD] uint32
+    id<MTLBuffer> buf_tq_v_norms[NUM_FULL_ATTN_LAYERS];  // [GPU_TQ_SEQ, NUM_KV_HEADS] float32
+    id<MTLBuffer> buf_tq_rot;         // [HEAD_DIM * HEAD_DIM] float32 — orthogonal Pi
+    id<MTLBuffer> buf_tq_inv_rot;     // [HEAD_DIM * HEAD_DIM] float32 — Pi^T
+    id<MTLBuffer> buf_tq_encode_k;    // [NUM_KV_HEADS * HEAD_DIM] fp32
+    id<MTLBuffer> buf_tq_encode_v;    // [NUM_KV_HEADS * HEAD_DIM] fp32
+    id<MTLBuffer> buf_tq_encode_k_norms; // [NUM_KV_HEADS] fp32
+    id<MTLBuffer> buf_tq_encode_v_norms; // [NUM_KV_HEADS] fp32
+    id<MTLComputePipelineState> tq_fused_attn_pipe;
+    id<MTLComputePipelineState> tq_encode_pipe;
+    id<MTLComputePipelineState> tq_pack_update_pipe;
+    id<MTLComputePipelineState> tq_dequant_pipe;
+    int use_tq_kv;  // 1 = compressed KV, 0 = float KV
+
     // CMD3 GPU-side combine buffers (weighted_sum + residual + norm on GPU)
     id<MTLComputePipelineState> moe_combine_residual;  // fused combine kernel
     id<MTLBuffer> buf_moe_hidden;     // [HIDDEN_DIM floats] GPU combine output (hidden state)
@@ -1054,6 +1121,15 @@ static MetalCtx *metal_setup(void) {
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
+    ctx->tq_fused_attn_pipe  = makePipe(@"tq_fused_attention");
+    ctx->tq_encode_pipe      = makePipe(@"tq_encode_packed");
+    ctx->tq_pack_update_pipe  = makePipe(@"tq_pack_update");
+    ctx->tq_dequant_pipe     = makePipe(@"tq_dequant_all");
+    if (!ctx->tq_fused_attn_pipe) {
+        fprintf(stderr, "[metal] WARNING: tq_fused_attention not available -- TurboQuant disabled\n");
+    } else {
+        printf("[metal] TurboQuant pipelines ready\n");
+    }
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
     ctx->conv1d_step       = makePipe(@"conv1d_step");
@@ -1167,27 +1243,97 @@ static MetalCtx *metal_setup(void) {
     ctx->buf_cmd3_sum_sq    = [ctx->device newBufferWithLength:sizeof(float)
                                                         options:MTLResourceStorageModeShared];
 
-    // GPU attention buffers
+    // GPU attention buffers — TQ_KV=1: compressed KV, TQ_KV=0: float KV
     {
         size_t kv_dim = NUM_KV_HEADS * HEAD_DIM;  // 512
         size_t kv_cache_size = GPU_KV_SEQ * kv_dim * sizeof(float);
-        for (int i = 0; i < NUM_FULL_ATTN_LAYERS; i++) {
-            ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_cache_size
-                                                        options:MTLResourceStorageModeShared];
-            ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_cache_size
-                                                        options:MTLResourceStorageModeShared];
+
+        ctx->use_tq_kv = (getenv("TQ_KV") && atoi(getenv("TQ_KV")) == 1) ? 1 : 0;
+        if (ctx->use_tq_kv && !ctx->tq_fused_attn_pipe) {
+            fprintf(stderr, "[metal] TQ_KV=1 but TurboQuant pipelines unavailable -- falling back\n");
+            ctx->use_tq_kv = 0;
         }
+
+        if (ctx->use_tq_kv) {
+            printf("[metal] TurboQuant KV compression ENABLED\n");
+            size_t tq_packed_size = (size_t)GPU_TQ_SEQ * NUM_KV_HEADS * TQ_WORDS_PER_HEAD * sizeof(uint32_t);
+            size_t tq_norm_size   = (size_t)GPU_TQ_SEQ * NUM_KV_HEADS * sizeof(float);
+            for (int i = 0; i < NUM_FULL_ATTN_LAYERS; i++) {
+                ctx->buf_tq_k_packed[i] = [ctx->device newBufferWithLength:tq_packed_size
+                                                             options:MTLResourceStorageModeShared];
+                ctx->buf_tq_k_norms[i]  = [ctx->device newBufferWithLength:tq_norm_size
+                                                            options:MTLResourceStorageModeShared];
+                ctx->buf_tq_v_packed[i] = [ctx->device newBufferWithLength:tq_packed_size
+                                                             options:MTLResourceStorageModeShared];
+                ctx->buf_tq_v_norms[i]  = [ctx->device newBufferWithLength:tq_norm_size
+                                                            options:MTLResourceStorageModeShared];
+            }
+            ctx->buf_tq_rot     = [ctx->device newBufferWithLength:HEAD_DIM * HEAD_DIM * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+            ctx->buf_tq_inv_rot = [ctx->device newBufferWithLength:HEAD_DIM * HEAD_DIM * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+            ctx->buf_tq_encode_k = [ctx->device newBufferWithLength:NUM_KV_HEADS * HEAD_DIM * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+            ctx->buf_tq_encode_v = [ctx->device newBufferWithLength:NUM_KV_HEADS * HEAD_DIM * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+            ctx->buf_tq_encode_k_norms = [ctx->device newBufferWithLength:NUM_KV_HEADS * sizeof(float)
+                                                                   options:MTLResourceStorageModeShared];
+            ctx->buf_tq_encode_v_norms = [ctx->device newBufferWithLength:NUM_KV_HEADS * sizeof(float)
+                                                                   options:MTLResourceStorageModeShared];
+
+            // Temporal hedge: second command queue for racing identical dispatches
+            if (g_hedge_enabled) {
+                g_hedge_queue1 = [ctx->device newCommandQueue];
+                fprintf(stderr, "[hedge] Created second command queue\n");
+            }
+
+            // Generate orthogonal rotation matrix Pi via QR decomposition (seeded)
+            float *Q = (float *)malloc(HEAD_DIM * HEAD_DIM * sizeof(float));
+            srand(42);
+            for (int i = 0; i < HEAD_DIM * HEAD_DIM; i++) Q[i] = (float)(rand() % 1000 - 500) / 500.0f;
+            for (int j = 0; j < HEAD_DIM; j++) {
+                for (int i = 0; i < HEAD_DIM; i++) {
+                    float dot = 0.0f;
+                    for (int k = 0; k < j; k++) dot += Q[k * HEAD_DIM + i] * Q[k * HEAD_DIM + j];
+                    Q[j * HEAD_DIM + i] -= dot * Q[j * HEAD_DIM + i];
+                }
+                float norm = 0.0f;
+                for (int k = 0; k < HEAD_DIM; k++) norm += Q[k * HEAD_DIM + j] * Q[k * HEAD_DIM + j];
+                norm = sqrtf(norm + 1e-8f);
+                for (int k = 0; k < HEAD_DIM; k++) Q[j * HEAD_DIM + k] /= norm;
+            }
+            float *rot_ptr = (float *)[ctx->buf_tq_rot contents];
+            float *inv_ptr = (float *)[ctx->buf_tq_inv_rot contents];
+            memcpy(rot_ptr, Q, HEAD_DIM * HEAD_DIM * sizeof(float));
+            for (int i = 0; i < HEAD_DIM; i++)
+                for (int j = 0; j < HEAD_DIM; j++)
+                    inv_ptr[i * HEAD_DIM + j] = rot_ptr[j * HEAD_DIM + i];
+            free(Q);
+            printf("[metal] TurboQuant: %d layers x %.1f KB/layer KV\n",
+                   NUM_FULL_ATTN_LAYERS, (double)(tq_packed_size * 2 + tq_norm_size * 2) / 1e3);
+        } else {
+            // Standard float KV cache
+            for (int i = 0; i < NUM_FULL_ATTN_LAYERS; i++) {
+                ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_cache_size
+                                                            options:MTLResourceStorageModeShared];
+                ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_cache_size
+                                                            options:MTLResourceStorageModeShared];
+            }
+            printf("[metal] Float KV: %d layers x %.1f MB/layer\n",
+                   NUM_FULL_ATTN_LAYERS, (double)(kv_cache_size * 2) / 1e6);
+        }
+
         ctx->buf_attn_q      = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
-        ctx->buf_attn_scores = [ctx->device newBufferWithLength:(size_t)NUM_ATTN_HEADS * GPU_KV_SEQ * sizeof(float)
+        ctx->buf_attn_scores = [ctx->device newBufferWithLength:(size_t)NUM_ATTN_HEADS * GPU_TQ_SEQ * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
         ctx->buf_attn_out    = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
         ctx->buf_attn_gate   = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
-        printf("[metal] GPU attention buffers: %d KV caches (%.1f MB each), scores buf %.1f MB\n",
-               NUM_FULL_ATTN_LAYERS, kv_cache_size / 1e6,
-               (double)(NUM_ATTN_HEADS * MAX_SEQ_LEN * sizeof(float)) / 1e6);
+
+        printf("[metal] GPU attention buffers: scores buf %.1f MB\n",
+               (double)(NUM_ATTN_HEADS * GPU_TQ_SEQ * sizeof(float)) / 1e6);
     }
 
     // Persistent GPU state buffers for delta-net (linear attention layers)
@@ -4522,12 +4668,55 @@ static void fused_layer_forward(
         memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
 
         int fa_idx = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1;
-        if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+        // Skip float KV mirror when using TurboQuant (buf_kv_k/v not allocated in that mode)
+        if (g_metal && g_metal->attn_scores_pipe && !g_metal->use_tq_kv &&
+            fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
             memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
                    k_out, kv_dim * sizeof(float));
             memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
                    v_out, kv_dim * sizeof(float));
         }
+
+        // TurboQuant KV cache update — compress and append to compressed cache
+        if (g_metal && g_metal->use_tq_kv && g_metal->tq_pack_update_pipe) {
+            int tq_fa_idx = fa_idx;
+            uint32_t pos32 = (uint32_t)cache_pos;
+            uint32_t GPU_TQ_SEQ32 = GPU_TQ_SEQ;
+            float *encode_k = (float *)[g_metal->buf_tq_encode_k contents];
+            float *encode_v = (float *)[g_metal->buf_tq_encode_v contents];
+            float *encode_k_norms = (float *)[g_metal->buf_tq_encode_k_norms contents];
+            float *encode_v_norms = (float *)[g_metal->buf_tq_encode_v_norms contents];
+            memcpy(encode_k, k_out, NUM_KV_HEADS * HEAD_DIM * sizeof(float));
+            memcpy(encode_v, v_out, NUM_KV_HEADS * HEAD_DIM * sizeof(float));
+            for (int kv_h = 0; kv_h < NUM_KV_HEADS; kv_h++) {
+                float k_sq = 0.0f, v_sq = 0.0f;
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    float kd = encode_k[kv_h * HEAD_DIM + d];
+                    float vd = encode_v[kv_h * HEAD_DIM + d];
+                    k_sq += kd * kd; v_sq += vd * vd;
+                }
+                encode_k_norms[kv_h] = sqrtf(k_sq + RMS_NORM_EPS);
+                encode_v_norms[kv_h] = sqrtf(v_sq + RMS_NORM_EPS);
+            }
+            id<MTLCommandBuffer> tq_cmd = [g_metal->queue commandBuffer];
+            id<MTLComputeCommandEncoder> tq_enc = [tq_cmd computeCommandEncoder];
+            [tq_enc setComputePipelineState:g_metal->tq_pack_update_pipe];
+            [tq_enc setBuffer:g_metal->buf_tq_encode_k offset:0 atIndex:0];
+            [tq_enc setBuffer:g_metal->buf_tq_encode_v offset:0 atIndex:1];
+            [tq_enc setBuffer:g_metal->buf_tq_rot offset:0 atIndex:2];
+            [tq_enc setBuffer:g_metal->buf_tq_k_packed[fa_idx] offset:0 atIndex:3];
+            [tq_enc setBuffer:g_metal->buf_tq_encode_k_norms offset:0 atIndex:4];
+            [tq_enc setBuffer:g_metal->buf_tq_v_packed[fa_idx] offset:0 atIndex:5];
+            [tq_enc setBuffer:g_metal->buf_tq_encode_v_norms offset:0 atIndex:6];
+            [tq_enc setBytes:&pos32 length:4 atIndex:7];
+            [tq_enc setBytes:&GPU_TQ_SEQ32 length:4 atIndex:8];
+            [tq_enc dispatchThreadgroups:MTLSizeMake(NUM_KV_HEADS * TQ_WORDS_PER_HEAD, 1, 1)
+                      threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [tq_enc endEncoding];
+            [tq_cmd commit];
+            [tq_cmd waitUntilCompleted];
+        }
+
         kv->len++;
 
         // Scaled dot-product attention (GQA) — GPU or CPU
@@ -4827,25 +5016,90 @@ static void fused_layer_forward(
             uint32_t seq_stride = GPU_KV_SEQ;
             uint32_t hpkv = (uint32_t)heads_per_kv;
 
-            // Enc A1: attn_scores_batched
-            {
-                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->attn_scores_pipe];
-                [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
-                [enc setBuffer:g_metal->buf_kv_k[fa_idx]    offset:0 atIndex:1];
-                [enc setBuffer:g_metal->buf_attn_scores     offset:0 atIndex:2];
-                [enc setBytes:&hd        length:4 atIndex:3];
-                [enc setBytes:&kvd       length:4 atIndex:4];
-                [enc setBytes:&sl        length:4 atIndex:5];
-                [enc setBytes:&seq_stride length:4 atIndex:6];
-                [enc setBytes:&scale     length:4 atIndex:7];
-                [enc setBytes:&hpkv      length:4 atIndex:8];
-                [enc setBytes:&sl        length:4 atIndex:9];
-                uint32_t total_tgs = sl * NUM_ATTN_HEADS;
-                [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            // TurboQuant fused attention: 1 dispatch instead of 3 (Enc A1+A2+A3)
+            if (g_metal->use_tq_kv && g_metal->tq_fused_attn_pipe) {
+                uint32_t T_kv32 = sl;
+                uint32_t causal_offset32 = 0;
+                uint32_t GPU_TQ_SEQ32 = GPU_TQ_SEQ;
+                id<MTLCommandBuffer> cmd_tq = [g_metal->queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cmd_tq computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->tq_fused_attn_pipe];
+                [enc setBuffer:g_metal->buf_attn_q                                    offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_attn_gate                                 offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_tq_k_packed[fa_idx]  offset:0 atIndex:2];
+                [enc setBuffer:g_metal->buf_tq_k_norms[fa_idx]     offset:0 atIndex:3];
+                [enc setBuffer:g_metal->buf_tq_v_packed[fa_idx] offset:0 atIndex:4];
+                [enc setBuffer:g_metal->buf_tq_v_norms[fa_idx]     offset:0 atIndex:5];
+                [enc setBuffer:g_metal->buf_tq_rot                 offset:0 atIndex:6];
+                [enc setBuffer:g_metal->buf_tq_inv_rot              offset:0 atIndex:7];
+                [enc setBuffer:g_metal->buf_attn_out                                   offset:0 atIndex:8];
+                [enc setBytes:&T_kv32          length:4 atIndex:9];
+                [enc setBytes:&GPU_TQ_SEQ32    length:4 atIndex:10];
+                [enc setBytes:&causal_offset32 length:4 atIndex:11];
+                [enc dispatchThreadgroups:MTLSizeMake(NUM_ATTN_HEADS * 256, 1, 1)
+                          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
-            }
+                CFAbsoluteTime t_tq_start = CFAbsoluteTimeGetCurrent();
+                [cmd_tq commit];
+                [cmd_tq waitUntilCompleted];
+                double tq_elapsed = (CFAbsoluteTimeGetCurrent() - t_tq_start) * 1000.0;
+                if (g_timing_enabled) {
+                    g_timing.tq_kernel_time += tq_elapsed;
+                    if (g_tq_sample_count < TQ_HIST_MAX)
+                        g_tq_samples[g_tq_sample_count++] = (float)tq_elapsed;
+                }
+                // Temporal hedge: duplicate the exact same kernel on a second queue.
+                // Both read identical addresses; whichever queue finishes first wins.
+                if (g_hedge_enabled && g_hedge_queue1) {
+                    CFAbsoluteTime t_hedge_start = CFAbsoluteTimeGetCurrent();
+                    id<MTLCommandBuffer> cmd_hedge = [g_hedge_queue1 commandBuffer];
+                    id<MTLComputeCommandEncoder> enc_h = [cmd_hedge computeCommandEncoder];
+                    [enc_h setComputePipelineState:g_metal->tq_fused_attn_pipe];
+                    [enc_h setBuffer:g_metal->buf_attn_q                        offset:0 atIndex:0];
+                    [enc_h setBuffer:g_metal->buf_attn_gate                     offset:0 atIndex:1];
+                    [enc_h setBuffer:g_metal->buf_tq_k_packed[fa_idx]         offset:0 atIndex:2];
+                    [enc_h setBuffer:g_metal->buf_tq_k_norms[fa_idx]          offset:0 atIndex:3];
+                    [enc_h setBuffer:g_metal->buf_tq_v_packed[fa_idx]         offset:0 atIndex:4];
+                    [enc_h setBuffer:g_metal->buf_tq_v_norms[fa_idx]          offset:0 atIndex:5];
+                    [enc_h setBuffer:g_metal->buf_tq_rot                        offset:0 atIndex:6];
+                    [enc_h setBuffer:g_metal->buf_tq_inv_rot                    offset:0 atIndex:7];
+                    [enc_h setBuffer:g_metal->buf_attn_out                      offset:0 atIndex:8];
+                    uint32_t T_kv32 = sl;
+                    uint32_t GPU_TQ_SEQ32 = GPU_TQ_SEQ;
+                    uint32_t causal_offset32 = 0;
+                    [enc_h setBytes:&T_kv32           length:4 atIndex:9];
+                    [enc_h setBytes:&GPU_TQ_SEQ32     length:4 atIndex:10];
+                    [enc_h setBytes:&causal_offset32  length:4 atIndex:11];
+                    [enc_h dispatchThreadgroups:MTLSizeMake(NUM_ATTN_HEADS * 256, 1, 1)
+                              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc_h endEncoding];
+                    [cmd_hedge commit];
+                    [cmd_hedge waitUntilCompleted];
+                    double hedge_elapsed = (CFAbsoluteTimeGetCurrent() - t_hedge_start) * 1000.0;
+                    double effective = (tq_elapsed < hedge_elapsed) ? tq_elapsed : hedge_elapsed;
+                    if (g_timing_enabled && g_tq_sample_count < TQ_HIST_MAX)
+                        g_tq_samples[g_tq_sample_count++] = (float)effective;
+                }
+            } else {
+                // Enc A1: attn_scores_batched
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->attn_scores_pipe];
+                    [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_kv_k[fa_idx]    offset:0 atIndex:1];
+                    [enc setBuffer:g_metal->buf_attn_scores     offset:0 atIndex:2];
+                    [enc setBytes:&hd        length:4 atIndex:3];
+                    [enc setBytes:&kvd       length:4 atIndex:4];
+                    [enc setBytes:&sl        length:4 atIndex:5];
+                    [enc setBytes:&seq_stride length:4 atIndex:6];
+                    [enc setBytes:&scale     length:4 atIndex:7];
+                    [enc setBytes:&hpkv      length:4 atIndex:8];
+                    [enc setBytes:&sl        length:4 atIndex:9];
+                    uint32_t total_tgs = sl * NUM_ATTN_HEADS;
+                    [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
             // Enc A2: attn_softmax_batched
             {
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
@@ -4874,6 +5128,7 @@ static void fused_layer_forward(
                 [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
+                }  // end else (non-TurboQuant path)
             }
             // Enc A4: sigmoid_gate
             {
@@ -6562,7 +6817,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2GHh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6577,6 +6832,7 @@ int main(int argc, char **argv) {
                 case 'L': gpu_linear_attn_enabled = 0; break;
                 case 'S': linear_attn_bypass = 1; break;
                 case 'T': g_timing_enabled = 1; break;
+                case 'H': g_hedge_enabled = 1; fprintf(stderr, "[hedge] Temporal hedge enabled\n"); break;
                 case 'F': g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
