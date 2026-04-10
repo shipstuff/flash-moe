@@ -3624,9 +3624,11 @@ static id<MTLBuffer> malloc_cache_insert(MallocExpertCache *cache, int layer, in
                 target = i;
             }
         }
-        cache_telemetry_evict(cache->layer_idx[target], cache->expert_idx[target]);
-        if (cache->layer_idx[target] >= 0 && cache->expert_idx[target] >= 0) {
-            cache->entry_idx[cache->layer_idx[target]][cache->expert_idx[target]] = -1;
+        int old_layer = cache->layer_idx[target];
+        int old_expert = cache->expert_idx[target];
+        cache_telemetry_evict(old_layer, old_expert);
+        if (old_layer >= 0 && old_expert >= 0) {
+            cache->entry_idx[old_layer][old_expert] = -1;
         }
     }
 

@@ -26,3 +26,12 @@ HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	3124	0	5.5	keep	C/METAL baseline (no TQ):
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	3074	0	5.5	keep	C/METAL + TurboQuant KV: 5.99 tok/s, 3074ms TTFT (+2.2% gen). tq_kernel 0.066ms/layer. OS page cache.
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	3378	0	5.5	discard	C/METAL + TQ + temporal hedge (-H): 5.97 tok/s (regressed). p99.99 TQ 0.407ms vs 0.424ms no-hedge. Hedge dispatch overhead > hedge benefit on M4 Pro. Zero stalls in both.
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	0	0	5.5	keep	TQ latency histogram (3000+ samples, 15 full-attn layers): p50=0.320ms, p99.99=0.424ms, zero stall candidates. tq_fused_attention is stall-free on M4 Pro. Dominant cost is expert_io at 1.170ms/layer, not KV cache.
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	256	8.52	2905	14.0	keep	256tok generation, long prompt prefill, M4 Pro, no malloc cache, K=4, GPU linear. expert_io=0.579ms, cmd1_wait=0.775ms, cmd2_wait=0.463ms.
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	128	14.72	1086	25.3	keep	128tok, M256 malloc cache, K=4, no TQ. Hit rate 8077/31920. Baseline for malloc cache comparison.
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	256	14.44	1031	22.7	keep	256tok, M256 malloc cache, K=4, no TQ. Hit rate 14236/48404.
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	128	14.49	1622	26.8	keep	128tok story gen, M256, K=4, no TQ. expert_io=0.579ms dominant.
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	128	14.80	1081	25.3	keep	128tok, M256, K=4, TQ_KV=1. tq_kernel_time=0.000ms, expert_io=0.019ms, total_layer=1.048ms.
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	256	14.98	1510	24.6	keep	256tok story, M256, K=4, TQ_KV=1. tq_kernel_time=0.000ms, expert_io=0.019ms, total_layer=1.048ms.
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	64	8.64	1407	0.0	keep	64-entry default (no malloc cache). OS page cache only. Baseline comparison.
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	128	15.48	1107	0.0	keep	128tok, M128 malloc cache (0.9GB). Cold fill - 0% hit rate on first run. 31920 misses.
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	128	14.41	1018	30.5	keep	128tok, M512 malloc cache (3.6GB). Larger cache doesn't improve tok/s. 9745 hits, 22175 misses.
