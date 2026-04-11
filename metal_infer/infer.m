@@ -3254,8 +3254,20 @@ static void io_pool_init(void) {
     g_io_pool.shutdown = 0;
     g_io_pool.generation = 0;
     g_io_pool.tasks = NULL;
+
+    // Pin I/O worker threads to P-cores via QoS. These threads do parallel
+    // expert pread from SSD and are on the critical path for every layer's
+    // MoE dispatch — running them on E-cores under default QoS would add
+    // scheduling latency per layer. QOS_CLASS_USER_INTERACTIVE is the
+    // strongest hint to the scheduler to keep them on the performance
+    // cluster, matching the existing dispatch queue choice elsewhere.
+    pthread_attr_t io_attr;
+    pthread_attr_init(&io_attr);
+    pthread_attr_set_qos_class_np(&io_attr, QOS_CLASS_USER_INTERACTIVE, 0);
     for (int i = 0; i < NUM_IO_THREADS; i++)
-        pthread_create(&g_io_pool.threads[i], NULL, io_pool_worker, (void*)(intptr_t)i);
+        pthread_create(&g_io_pool.threads[i], &io_attr, io_pool_worker, (void*)(intptr_t)i);
+    pthread_attr_destroy(&io_attr);
+
     g_io_pool_initialized = 1;
 }
 
@@ -8618,6 +8630,15 @@ static int test_batched_attention(const char *arg) {
 }
 
 int main(int argc, char **argv) {
+    // Pin the main inference thread to P-cores. Inference is compute-heavy
+    // and latency-sensitive; under default QoS the main thread can be
+    // demoted to the efficiency cluster under memory pressure, adding
+    // scheduling jitter to every layer's CPU-side work (RMS norm, RoPE,
+    // sgemm Q rotation, softmax, routing). QOS_CLASS_USER_INTERACTIVE
+    // is the strongest "keep me on the performance cluster" signal.
+    // No effect on GPU work, only on Objective-C / C CPU compute.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+
     @autoreleasepool {
         const char *model_path = MODEL_PATH_DEFAULT;
         const char *weights_path = NULL;
