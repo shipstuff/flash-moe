@@ -1366,8 +1366,13 @@ kernel void tq_encode_packed(
     uint k_base = (token_idx * NUM_KV_HEADS + kv_head) * HEAD_DIM;
     uint v_base = (token_idx * NUM_KV_HEADS + kv_head) * HEAD_DIM;
 
-    float inv_k_norm = 1.0f / (k_norms_in[token_idx * NUM_KV_HEADS + kv_head] + 1e-8f);
-    float inv_v_norm = 1.0f / (v_norms_in[token_idx * NUM_KV_HEADS + kv_head] + 1e-8f);
+    // After orthonormal rotation each per-dim component of (Pi @ k)/||k|| has
+    // per-dim std ~ 1/sqrt(HEAD_DIM). Our centroids {-1.5,-0.5,+0.5,+1.5} are
+    // calibrated for unit-variance inputs, so scale by sqrt(HEAD_DIM) before
+    // quantization; the decoder applies the inverse scale.
+    const float tq_scale = metal::fast::sqrt((float)HEAD_DIM);  // 16 for HEAD_DIM=256
+    float inv_k_norm = tq_scale / (k_norms_in[token_idx * NUM_KV_HEADS + kv_head] + 1e-8f);
+    float inv_v_norm = tq_scale / (v_norms_in[token_idx * NUM_KV_HEADS + kv_head] + 1e-8f);
 
     uint32_t k_packed = 0;
     uint32_t v_packed = 0;
@@ -1383,7 +1388,7 @@ kernel void tq_encode_packed(
             k_dot += k_new[k_base + j] * rotation_matrix[mat_base + j];
             v_dot += v_new[v_base + j] * rotation_matrix[mat_base + j];
         }
-        float k_rot = k_dot * inv_k_norm;
+        float k_rot = k_dot * inv_k_norm;  // now ~ unit variance
         float v_rot = v_dot * inv_v_norm;
 
         uint k_idx = (k_rot >= 1.0f) ? 3u : (k_rot >= 0.0f) ? 2u : (k_rot >= -1.0f) ? 1u : 0u;
@@ -1458,6 +1463,9 @@ kernel void tq_fused_attention(
     uint kv_head = head / heads_per_kv;
     uint q_off = head * HEAD_DIM;
 
+    // Inverse of the encoder scale — see tq_encode_packed / tq_pack_update.
+    const float tq_inv_scale = metal::fast::rsqrt((float)HEAD_DIM);  // 1/16 for HEAD_DIM=256
+
     // 8 simdgroups, each handles keys at stride 8: sid, sid+8, sid+16, ...
     // Keys per simdgroup = ceil(T_kv / 8) but we loop with stride 8
     int num_sg = 8;
@@ -1483,7 +1491,7 @@ kernel void tq_fused_attention(
             uint bit_off_d = (d % 16) * 2;
             uint32_t k_word = k_packed[k_packed_base + word_idx_d];
             uint k_idx = (k_word >> bit_off_d) & 0x3u;
-            float k_val = CENTROIDS[k_idx] * k_norm;
+            float k_val = CENTROIDS[k_idx] * k_norm * tq_inv_scale;
             partial_qk[i] = q_rot[q_off + d] * k_val;
         }
         float partial_dot = 0.0f;
@@ -1506,7 +1514,7 @@ kernel void tq_fused_attention(
             uint bit_off_d = (d % 16) * 2;
             uint32_t v_word = v_packed[v_packed_base + word_idx_d];
             uint v_idx = (v_word >> bit_off_d) & 0x3u;
-            float v_val = CENTROIDS[v_idx] * v_norm;
+            float v_val = CENTROIDS[v_idx] * v_norm * tq_inv_scale;
             local_acc[i] = local_acc[i] * factor + w * v_val;
         }
 
@@ -1519,6 +1527,11 @@ kernel void tq_fused_attention(
     threadgroup float tg_max[8];
     threadgroup float tg_sum[8];
     threadgroup float tg_acc[8 * HEAD_DIM];
+    // Shared softmax-normalized attention output (one vector) + global scalars.
+    // After Phase 3 we overwrite tg_acc[0..HEAD_DIM) with the final per-head
+    // attention vector so every thread can read it during the inverse rotation.
+    threadgroup float tg_global_max;
+    threadgroup float tg_global_sum;
 
     if (lane == 0) {
         tg_max[sid] = local_max;
@@ -1532,40 +1545,54 @@ kernel void tq_fused_attention(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- Phase 3: Global softmax normalization (lane 0 of simdgroup 0) ----
-    float global_max = -1e10f;
-    float global_sum = 0.0f;
+    // ---- Phase 3: Global softmax normalization (broadcast via threadgroup) ----
     if (lid == 0) {
+        float gmax = -1e10f;
         for (uint s = 0; s < num_sg; s++) {
-            global_max = max(global_max, tg_max[s]);
+            gmax = max(gmax, tg_max[s]);
         }
+        float gsum = 0.0f;
         for (uint s = 0; s < num_sg; s++) {
-            global_sum += tg_sum[s] * metal::fast::exp(tg_max[s] - global_max);
+            gsum += tg_sum[s] * metal::fast::exp(tg_max[s] - gmax);
+        }
+        tg_global_max = gmax;
+        tg_global_sum = gsum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_max = tg_global_max;
+    float global_sum = tg_global_sum;
+    float inv_sum = (global_sum > 1e-8f) ? (1.0f / global_sum) : 0.0f;
+
+    // ---- Phase 3b: combine per-simdgroup partial accumulators into the final
+    //               softmax-normalized attention output vector in tg_acc[0..HEAD_DIM)
+    // Use simdgroup 0 (32 lanes × 8 dims = 256 = HEAD_DIM) to write it.
+    if (sid == 0) {
+        for (int i = 0; i < LANES_PER_SIMD; i++) {
+            uint d = lane + i * SIMD_SIZE;
+            if (d >= HEAD_DIM) continue;
+            float accum = 0.0f;
+            for (uint s = 0; s < num_sg; s++) {
+                float factor = metal::fast::exp(tg_max[s] - global_max);
+                accum += tg_acc[s * HEAD_DIM + d] * factor;
+            }
+            // Writing into slot s=0 of tg_acc is safe: every later read in
+            // Phase 4 uses offsets in [0, HEAD_DIM), so we reuse this region
+            // as the final output vector.
+            tg_acc[d] = accum * inv_sum;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv_sum = (global_sum > 1e-8f) ? (1.0f / global_sum) : 0.0f;
 
-    // ---- Phase 4: Reconstruct + inverse rotation ----
-    float acc_rot[LANES_PER_SIMD];
-    for (int i = 0; i < LANES_PER_SIMD; i++) {
-        uint d = lane + i * SIMD_SIZE;
-        if (d >= HEAD_DIM) { acc_rot[i] = 0.0f; continue; }
-        float accum = 0.0f;
-        for (uint s = 0; s < num_sg; s++) {
-            float factor = metal::fast::exp(tg_max[s] - global_max);
-            accum += tg_acc[s * HEAD_DIM + d] * factor;
-        }
-        acc_rot[i] = (global_sum > 1e-8f) ? (accum * inv_sum) : 0.0f;
-    }
-
+    // ---- Phase 4: Inverse rotation out[d] = sum_j( acc[j] * inv_rot[j, d] )
+    // Each thread owns LANES_PER_SIMD output dimensions.
     float out[LANES_PER_SIMD];
     for (int i = 0; i < LANES_PER_SIMD; i++) {
         uint d = lane + i * SIMD_SIZE;
         if (d >= HEAD_DIM) { out[i] = 0.0f; continue; }
         float sum = 0.0f;
         for (uint j = 0; j < HEAD_DIM; j++) {
-            sum += acc_rot[i] * inv_rot_matrix[j * HEAD_DIM + d];
+            sum += tg_acc[j] * inv_rot_matrix[j * HEAD_DIM + d];
         }
         out[i] = sum;
     }
@@ -1643,8 +1670,10 @@ kernel void tq_pack_update(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float inv_k_norm = 1.0f / (k_norm + 1e-8f);
-    float inv_v_norm = 1.0f / (v_norm + 1e-8f);
+    // Same unit-variance scale as tq_encode_packed.
+    const float tq_scale = metal::fast::sqrt((float)HEAD_DIM);
+    float inv_k_norm = tq_scale / (k_norm + 1e-8f);
+    float inv_v_norm = tq_scale / (v_norm + 1e-8f);
 
     uint32_t k_packed = 0;
     uint32_t v_packed = 0;
@@ -1659,7 +1688,7 @@ kernel void tq_pack_update(
             k_dot += k_new[k_off + j] * rotation_matrix[mat_base + j];
             v_dot += v_new[v_off + j] * rotation_matrix[mat_base + j];
         }
-        float k_rot = k_dot * inv_k_norm;
+        float k_rot = k_dot * inv_k_norm;  // now ~ unit variance
         float v_rot = v_dot * inv_v_norm;
         uint k_idx = (k_rot >= 1.0f) ? 3u : (k_rot >= 0.0f) ? 2u : (k_rot >= -1.0f) ? 1u : 0u;
         uint v_idx = (v_rot >= 1.0f) ? 3u : (v_rot >= 0.0f) ? 2u : (v_rot >= -1.0f) ? 1u : 0u;
@@ -1698,6 +1727,9 @@ kernel void tq_dequant_all(
     uint d = tgid;
     if (d >= HEAD_DIM) return;
 
+    // Match the encoder scale — see tq_encode_packed / tq_pack_update.
+    const float tq_inv_scale = metal::fast::rsqrt((float)HEAD_DIM);
+
     uint word_idx = d / 16;
     uint bit_off = (d % 16) * 2;
 
@@ -1709,11 +1741,11 @@ kernel void tq_dequant_all(
 
             uint32_t k_word = k_packed[packed_base + word_idx];
             uint k_idx = (k_word >> bit_off) & 0x3u;
-            k_out[out_base + d] = CENTROIDS[k_idx] * k_norms[norms_idx];
+            k_out[out_base + d] = CENTROIDS[k_idx] * k_norms[norms_idx] * tq_inv_scale;
 
             uint32_t v_word = v_packed[packed_base + word_idx];
             uint v_idx = (v_word >> bit_off) & 0x3u;
-            v_out[out_base + d] = CENTROIDS[v_idx] * v_norms[norms_idx];
+            v_out[out_base + d] = CENTROIDS[v_idx] * v_norms[norms_idx] * tq_inv_scale;
         }
     }
 }

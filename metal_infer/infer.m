@@ -1253,6 +1253,19 @@ static MetalCtx *metal_setup(void) {
             fprintf(stderr, "[metal] TQ_KV=1 but TurboQuant pipelines unavailable -- falling back\n");
             ctx->use_tq_kv = 0;
         }
+        // TurboQuant partial fixes applied 2026-04-10 but KV compression is
+        // still incorrect — diverges from the baseline CPU attention path
+        // starting at the generation step where the CPU KV cache first differs,
+        // suggesting either a memory-bounds issue in the TQ kernels or an
+        // aliasing bug in the shared Metal buffers. Until that is root-caused
+        // and fixed, TQ_KV=1 defaults to the float KV fallback and produces
+        // coherent output. Set TQ_KV_FORCE=1 to opt into the still-broken path.
+        // See benchmarks/2026-04-10-post-repack-e2e.md for the full list of
+        // TQ shader bugs (Gram-Schmidt, Phase 3/4, quantization scale).
+        if (ctx->use_tq_kv && !(getenv("TQ_KV_FORCE") && atoi(getenv("TQ_KV_FORCE")) == 1)) {
+            fprintf(stderr, "[metal] TQ_KV=1: TurboQuant is KNOWN BROKEN (multiple shader bugs, see benchmarks/2026-04-10-post-repack-e2e.md) -- forcing float KV fallback for coherent output. Set TQ_KV_FORCE=1 to run the broken path anyway.\n");
+            ctx->use_tq_kv = 0;
+        }
 
         if (ctx->use_tq_kv) {
             printf("[metal] TurboQuant KV compression ENABLED\n");
@@ -1287,20 +1300,28 @@ static MetalCtx *metal_setup(void) {
                 fprintf(stderr, "[hedge] Created second command queue\n");
             }
 
-            // Generate orthogonal rotation matrix Pi via QR decomposition (seeded)
+            // Generate orthogonal rotation matrix Pi via row Gram-Schmidt (seeded).
+            // Layout: Q is row-major [HEAD_DIM rows × HEAD_DIM cols]. After this loop,
+            // rows of Q are orthonormal — Pi = Q, Pi^T = transpose.
             float *Q = (float *)malloc(HEAD_DIM * HEAD_DIM * sizeof(float));
             srand(42);
             for (int i = 0; i < HEAD_DIM * HEAD_DIM; i++) Q[i] = (float)(rand() % 1000 - 500) / 500.0f;
             for (int j = 0; j < HEAD_DIM; j++) {
-                for (int i = 0; i < HEAD_DIM; i++) {
-                    float dot = 0.0f;
-                    for (int k = 0; k < j; k++) dot += Q[k * HEAD_DIM + i] * Q[k * HEAD_DIM + j];
-                    Q[j * HEAD_DIM + i] -= dot * Q[j * HEAD_DIM + i];
+                // Subtract projections of row j onto prior orthonormal rows 0..j-1
+                for (int k = 0; k < j; k++) {
+                    float proj = 0.0f;
+                    for (int i = 0; i < HEAD_DIM; i++)
+                        proj += Q[j * HEAD_DIM + i] * Q[k * HEAD_DIM + i];
+                    for (int i = 0; i < HEAD_DIM; i++)
+                        Q[j * HEAD_DIM + i] -= proj * Q[k * HEAD_DIM + i];
                 }
+                // Normalize row j to unit length
                 float norm = 0.0f;
-                for (int k = 0; k < HEAD_DIM; k++) norm += Q[k * HEAD_DIM + j] * Q[k * HEAD_DIM + j];
-                norm = sqrtf(norm + 1e-8f);
-                for (int k = 0; k < HEAD_DIM; k++) Q[j * HEAD_DIM + k] /= norm;
+                for (int i = 0; i < HEAD_DIM; i++)
+                    norm += Q[j * HEAD_DIM + i] * Q[j * HEAD_DIM + i];
+                norm = sqrtf(norm + 1e-12f);
+                for (int i = 0; i < HEAD_DIM; i++)
+                    Q[j * HEAD_DIM + i] /= norm;
             }
             float *rot_ptr = (float *)[ctx->buf_tq_rot contents];
             float *inv_ptr = (float *)[ctx->buf_tq_inv_rot contents];
@@ -3276,6 +3297,7 @@ static int parallel_pread_experts(
 ) {
     size_t esz = active_expert_size();
     InferPreadTask tasks[MAX_K];
+    memset(tasks, 0, sizeof(tasks));  // clear lz4_comp_buf/lz4_comp_size — must be 0 for non-LZ4 path
     for (int k = 0; k < K; k++) {
         tasks[k].fd = packed_fd;
         tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
@@ -3312,6 +3334,7 @@ static int parallel_pread_experts_into(
 ) {
     size_t esz = active_expert_size();
     InferPreadTask tasks[MAX_K];
+    memset(tasks, 0, sizeof(tasks));  // clear lz4_comp_buf/lz4_comp_size
     for (int k = 0; k < K; k++) {
         tasks[k].fd = packed_fd;
         tasks[k].dst = [dst_bufs[k] contents];
@@ -3701,6 +3724,7 @@ static void *infer_prefetch_thread_fn(void *arg) {
         size_t esz = active_expert_size();
         InferIOPlan *plan = &pf->plan;
         InferPreadTask tasks[MAX_K];
+        memset(tasks, 0, sizeof(tasks));  // clear lz4_comp_buf/lz4_comp_size
         for (int k = 0; k < plan->K; k++) {
             tasks[k].fd = plan->fd;
             tasks[k].dst = plan->dst[k];
@@ -5372,6 +5396,7 @@ static void fused_layer_forward(
             if (num_misses > 0) {
                 size_t esz = active_expert_size();
                 InferPreadTask tasks[MAX_K];
+                memset(tasks, 0, sizeof(tasks));  // clear lz4_comp_buf/lz4_comp_size
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
                     int cidx = miss_cache_idx[m];
@@ -5428,6 +5453,7 @@ static void fused_layer_forward(
             if (num_misses > 0) {
                 size_t esz = active_expert_size();
                 InferPreadTask tasks[MAX_K];
+                memset(tasks, 0, sizeof(tasks));  // clear lz4_comp_buf/lz4_comp_size
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
                     tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
@@ -5488,6 +5514,7 @@ static void fused_layer_forward(
             // Parallel sync-pread misses into buf_A
             if (miss_count > 0) {
                 InferPreadTask tasks[MAX_K];
+                memset(tasks, 0, sizeof(tasks));  // clear lz4_comp_buf/lz4_comp_size
                 size_t esz = active_expert_size();
                 for (int m = 0; m < miss_count; m++) {
                     int k = miss_k_slots[m];

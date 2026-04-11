@@ -11,10 +11,15 @@
 - Tokenization + vocab loading
 - Model weights (`model_weights.bin`) + manifest (`model_weights.json`)
 - 4-bit packed experts (`/models/Qwen3.5-397B-A17B-4bit/packed_experts/layer_XX.bin`)
+  — rebuilt 2026-04-10 via `repack_experts_v2.py` with correct safetensors offsets
 - Metal GPU pipeline (fused MoE layers via `fused_layer_forward`)
-- Malloc-based expert LRU cache (`--malloc-cache N`)
+- Malloc-based expert LRU cache (`--malloc-cache N`) — lz4_comp_buf stack-init
+  bug fixed 2026-04-10 (see below)
 - OS page cache for expert I/O — 32 GB/s sequential reads
-- TurboQuant KV-cache shaders (TQ kernels compile, Metal library JIT succeeds)
+- TurboQuant KV-cache shaders compile; `TQ_KV=1` **safe-falls-back to float KV**
+  and produces coherent output (actual TQ attention is still broken — see below)
+- Temporal expert prediction (`--predict`) — functional, but a net regression
+  (~26% hit rate, -58% speed)
 - Per-layer timing breakdown (`--timing`)
 
 ### HTTP Server Mode (`--serve PORT`)
@@ -22,40 +27,66 @@
 - System prompt prefilling + KV cache snapshots
 - Per-request timing
 
-### Benchmark Results (2026-04-09, M4 Pro)
+### Benchmark Results (2026-04-10 overnight session, M4 Pro, post-repack)
+All runs coherent output on "Once upon a time..." clockmaker prompt unless noted.
 ```
-128tok, M256 malloc cache, K=4, no TQ:  14.72 tok/s
-128tok, M256 malloc cache, K=4, +TQ_KV: 14.80 tok/s
-256tok, M256 malloc cache, K=4, no TQ:  14.44 tok/s
-256tok story, M256, K=4, +TQ_KV:         14.98 tok/s
-128tok, M512 malloc cache:               14.41 tok/s
-64-entry cold baseline (no malloc):        8.64 tok/s
+no cache, 128tok, K=4:                   6.01 tok/s, TTFT 4311 ms, 104 coherent
+TQ_KV=1 (fallback), 128tok, K=4:         6.61 tok/s, TTFT 3883 ms, 104 coherent
+malloc-cache-64,  128tok, K=4:           6.13 tok/s, 0% hit (thrashing), coherent
+malloc-cache-512, 96tok,  K=4:           6.07 tok/s, 32.2% hit, coherent
+--predict, 128tok, K=4:                  2.51 tok/s, 26% hit, coherent (-58%!)
 ```
+Real baseline per-layer: expert_io=1.337ms, cmd1_wait=0.858ms,
+cmd2_wait=0.426ms, total_layer=2.703ms. This matches the "5.86 tok/s" reference
+numbers in top-level `CLAUDE.md` (difference is measurement noise).
+
+**The historical "14-15 tok/s with malloc cache" results in `results.tsv` were
+bogus** — the malloc cache's pread path was silently failing due to an
+uninitialized-stack-memory bug (lz4_comp_buf garbage → io_pool_worker took the
+LZ4 decompress path → pread into wild pointer → returned -1 → GPU computed on
+zero-filled cache buffers). The "fast" numbers were the speed of running a
+not-actually-doing-I/O path with garbage expert data. See the benchmark file
+`benchmarks/2026-04-10-post-repack-e2e.md` for full details.
 
 ---
 
 ## What's Broken
 
-### CLI hangs after tokenization (as of 2026-04-10)
-- **Symptom:** `Tokens (1): [9419]` prints, then hangs — no `[init]` header, no `[ttft]`
-- **Location:** Hang is after tokenization but before Metal init/weights loading completes
-- **Likely cause:** `metal_setup()` or `io_pool_init()` — not yet isolated
-- **Date:** Started after `packed_experts` rebuild at 2026-04-10 10:35 AM
-- **Packed expert format changed:** `expert_index.json` shows `expert_size: 2097152` vs hardcoded `EXPERT_SIZE: 7077888` in `infer.m` — mismatch not yet confirmed as root cause
+### TurboQuant attention (`TQ_KV=1`)
+- **Symptom:** With `TQ_KV_FORCE=1` (opt-in), output degrades to punctuation
+  garbage within ~15 generation steps once the GPU attention path engages
+- **Bugs identified and fixed (2026-04-10, shader still broken overall):**
+  1. Gram-Schmidt rotation matrix in `metal_setup()` was mixing row/column
+     indices — `buf_tq_rot` was not orthonormal. Fixed to standard row GS.
+  2. `tq_fused_attention` Phase 3 — `global_max`/`global_sum` computed only on
+     `lid==0` but used per-thread (other threads saw initial `-1e10`/`0`).
+     Fixed by broadcasting via `threadgroup float tg_global_max/tg_global_sum`.
+  3. `tq_fused_attention` Phase 4 — "inverse rotation" was
+     `sum += acc_rot[i] * inv_rot[j,d]` with `acc_rot[i]` outside the j-loop,
+     i.e., a scalar × a column sum, NOT a matrix-vector product. Fixed by
+     combining softmax-normalized per-simdgroup accumulators into
+     `tg_acc[0..HEAD_DIM)` via `sid==0` and doing a proper
+     `sum_j(tg_acc[j] * inv_rot[j,d])` in Phase 4.
+  4. Quantization scale mismatch — after orthonormal rotation each per-dim
+     component of `(Pi·k)/||k||` has std `~1/sqrt(HEAD_DIM)=1/16`, but the
+     encoder quantized with thresholds at `±1/0/-1` and the decoder
+     reconstructed `centroid*||k||` — off by `sqrt(HEAD_DIM)`. Fixed by
+     multiplying by `sqrt(HEAD_DIM)` at encode and `1/sqrt(HEAD_DIM)` at decode.
+- **Still broken:** With all 4 fixes applied, comparing baseline vs TQ_KV=1 at
+  32 tokens shows divergence at gen token 17 — before `gpu_attn_fuse` activates
+  (kv_len still < 32). That means the TQ buffer allocations or kernel writes
+  are corrupting the CPU float KV cache somehow. Likely a memory-bounds issue
+  in the TQ output buffers or a Metal shared-buffer aliasing bug. Not yet
+  root-caused.
+- **Current default:** init prints a warning, forces `use_tq_kv=0`, uses the
+  standard float KV cache and GPU attention path. Set `TQ_KV_FORCE=1` to opt
+  into the still-broken path for debugging.
 
-### TQ shader hang (pre-existing, not yet fixed)
-- **Symptom:** With TQ KV pipelines enabled (`TQ_KV=1`), generation hangs at token [5834] post-TTFT
-- **Location:** Inside the generation loop — hangs before summary output
-- **Note:** TQ kernels compile and pipeline creation succeeds, but execution hangs
-- **Status:** Unfixed; hang is in TQ execution path, not shader compilation
-
-### malloc_cache_insert eviction bug (partially fixed)
-- **Bug:** In `expert_cache_evict()` LRU path, `cache_telemetry_evict()` was called with already-cleared `layer_idx[target]`/`expert_idx[target]`
-- **Fix committed:** Capture old indices before clearing, call telemetry first, then clear entry_idx
-- **Status:** Fix committed in `8f76d02` but not yet verified on hardware
-
-### Temporal prediction (`--predict`) not yet tested
-- Flag `g_pred_enabled` wired up but no end-to-end verification
+### Temporal prediction (`--predict`) — functional net regression
+- 26% hit rate, -58% generation speed vs baseline. Matches historical
+  "-18% / 25% hit rate" note in top-level CLAUDE.md. Feature works e2e, output
+  coherent, but should stay off by default until a better prediction scheme
+  is found.
 
 ---
 
