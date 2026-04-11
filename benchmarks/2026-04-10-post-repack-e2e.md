@@ -198,13 +198,67 @@ zeros, leading directly to the buffer-binding bug above.
    basis. Added a one-time per-layer per-head matvec on CPU before the
    `memcpy` into `buf_attn_q` (gated on `g_metal->use_tq_kv`).
 
-### Validated benchmarks
+### Validated benchmarks (short context, scalar Q rotation)
 
 ```
 Baseline      128tok, K=4: 5.91 tok/s, 104 coherent tokens (EOS at 104)
 TQ_KV=1       128tok, K=4: 5.31 tok/s, 128 coherent tokens, KV cache 33.4 MB
 TQ_KV=1       256tok, K=4: 5.15 tok/s, 256 coherent tokens, KV cache 33.4 MB
 ```
+
+### Q rotation vectorized via Accelerate sgemm (2026-04-11)
+
+The hand-rolled `Pi @ q` matvec inside `fused_layer_forward` was 32 × 256 ×
+256 scalar muls × 60 layers = 31 M ops/token (~12 ms/token). Replaced with
+a single `cblas_sgemm` per layer that does all 32 heads at once as
+`q (NA, HD) × Pi^T (HD, HD) → q_rot (NA, HD)`. `cpu_attn` per layer
+0.205 → 0.065 ms (3.2× faster). 128-tok TQ generation 5.31 → 5.65 tok/s.
+
+### Long-context sweep (2026-04-11) — TQ wins where it matters
+
+Same prompt construction repeated to grow the context, 32–64 generated
+tokens per run, M4 Pro:
+
+```
+Context  Baseline cmd2_wait  TQ cmd2_wait  Baseline tok/s  TQ tok/s  TQ delta
+~30 tok       0.434              0.423            5.91         5.65    -4.4%
+~1k tok       0.710              0.423            4.98         5.40    +8.4%
+~2.4k tok     1.056              0.406            3.98         4.69   +17.8%
+```
+
+`cmd2_wait` is the stall time for the command buffer that contains the
+fused-layer GPU attention dispatches. Baseline grows roughly linearly with
+`kv_len` because the float KV cache is scanned in full every step. TQ
+stays flat (0.406–0.423 ms) because the compressed cache is constant size
+per token regardless of how many tokens have been seen.
+
+Per-layer breakdown at ~2.4k context, 48-token generation:
+
+```
+                  baseline    TQ_KV=1
+cmd1_wait         1.032 ms    0.974 ms
+cmd2_wait         1.056 ms    0.406 ms   ← attention dispatch flat in TQ
+cpu_attn          0.005 ms    0.062 ms   ← Q rotation via sgemm
+cmd2_encode       0.018 ms    0.098 ms
+tq_kernel_time    0.000 ms    0.079 ms
+expert_io         1.943 ms    1.881 ms
+total_layer       4.109 ms    3.475 ms
+generation        3.98 tok/s  4.69 tok/s
+```
+
+Crossover (TQ overhead = TQ savings) sits around **600–800 token
+context**. Beyond that TQ wins both on memory footprint (7.5×) **and**
+generation speed.
+
+Theoretical scaling: TQ keeps `cmd2_wait ≈ 0.41 ms` indefinitely; baseline
+grows ~0.20 ms per +1k tokens. Extrapolating:
+- 4k context: baseline ~1.6 ms cmd2_wait → TQ ~+30%
+- 8k context: baseline ~2.6 ms → TQ ~+50%
+
+These will be measured directly once the long-prompt prefill (linear in
+prompt length, ~8 minutes for 2k tokens) finishes for 4k.
+
+
 
 ### Per-layer timing comparison (TQ vs baseline at 128 tok)
 

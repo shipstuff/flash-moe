@@ -4789,22 +4789,27 @@ static void fused_layer_forward(
                 // TurboQuant stores K_rot=Pi@K and V_rot=Pi@V in the compressed
                 // KV cache. To get the correct dot product against the rotated K
                 // we need Q in the same basis:
-                //   dot(Pi@Q, Pi@K) = Q^T (Pi^T Pi) K = Q^T K  (Pi orthonormal)
-                // So pre-rotate Q per attention head before the memcpy. The
+                //   dot(Pi@Q, Pi@K) = Q^T (Pi^T Pi) K = Q^T K   (Pi orthonormal)
+                // The per-head rotation q_rot[h] = Pi @ q[h] across all heads
+                // is one Accelerate sgemm:
+                //   q_rot (NUM_ATTN_HEADS, HEAD_DIM)
+                //     = q (NUM_ATTN_HEADS, HEAD_DIM)
+                //     @ Pi^T (HEAD_DIM, HEAD_DIM)
+                // Hand-rolled scalar version cost ~0.21 ms/layer x 60 layers =
+                // 12.6 ms/token of pure CPU work; sgemm hits SIMD + multi-thread
+                // Accelerate paths and brings it to a fraction of that. The
                 // q_gate path is unchanged — it does NOT participate in the
-                // dot product, so it stays in the original basis.
+                // dot product so it stays in the original basis.
                 const float *Pi = (const float *)[g_metal->buf_tq_rot contents];
                 float *qbuf = (float *)[g_metal->buf_attn_q contents];
-                for (int h = 0; h < NUM_ATTN_HEADS; h++) {
-                    const float *qh = q + h * HEAD_DIM;
-                    float       *qo = qbuf + h * HEAD_DIM;
-                    for (int d = 0; d < HEAD_DIM; d++) {
-                        float s = 0.0f;
-                        const float *row = Pi + d * HEAD_DIM;
-                        for (int j = 0; j < HEAD_DIM; j++) s += row[j] * qh[j];
-                        qo[d] = s;
-                    }
-                }
+                cblas_sgemm(CblasRowMajor,
+                            CblasNoTrans, CblasTrans,        // q . Pi^T
+                            NUM_ATTN_HEADS, HEAD_DIM, HEAD_DIM,
+                            1.0f,
+                            q,    HEAD_DIM,                  // (NA, HD)
+                            Pi,   HEAD_DIM,                  // (HD, HD), used as Pi^T
+                            0.0f,
+                            qbuf, HEAD_DIM);                 // (NA, HD)
             } else {
                 memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
             }

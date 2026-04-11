@@ -31,15 +31,30 @@
 - Per-request timing
 
 ### Benchmark Results (2026-04-11 morning session, M4 Pro)
-All runs coherent output on "Once upon a time..." clockmaker prompt unless noted.
+All runs coherent output unless noted. Two key updates today: TQ now works
+end-to-end (8 bug fixes earlier in the day) and Q rotation is now done via
+Accelerate sgemm (cpu_attn dropped 0.205 → 0.065 ms/layer).
+
+Short context (16-token prompt):
 ```
 no cache,           128tok, K=4: 5.91 tok/s, 104 coherent (EOS at 104)
-TQ_KV=1 (fixed!),   128tok, K=4: 5.31 tok/s, 128 coherent, KV 33.4 MB (7.5x smaller)
-TQ_KV=1 (fixed!),   256tok, K=4: 5.15 tok/s, 256 coherent
+TQ_KV=1 (sgemm),    128tok, K=4: 5.65 tok/s, 128 coherent
+TQ_KV=1 (sgemm),    256tok, K=4: 5.15 tok/s, 256 coherent
 malloc-cache-64,    128tok, K=4: 6.13 tok/s, 0% hit (thrashing), coherent
 malloc-cache-512,    96tok, K=4: 6.07 tok/s, 32.2% hit, coherent
 --predict,          128tok, K=4: 2.51 tok/s, 26% hit, coherent (-58% net regression)
 ```
+
+Long context (TQ wins because it keeps cmd2_wait flat):
+```
+Context  Baseline cmd2_wait  TQ cmd2_wait  Baseline tok/s  TQ tok/s  TQ delta
+~30 tok       0.434              0.423            5.91         5.65    -4.4%
+~1k tok       0.710              0.423            4.98         5.40    +8.4%
+~2.4k tok     1.056              0.406            3.98         4.69   +17.8%
+```
+
+Crossover ≈ 600–800 token context. Beyond that TQ wins on both memory
+footprint (7.5x compression) and generation speed.
 Real baseline per-layer: expert_io=1.337ms, cmd1_wait=0.858ms,
 cmd2_wait=0.426ms, total_layer=2.703ms. This matches the "5.86 tok/s" reference
 numbers in top-level `CLAUDE.md` (difference is measurement noise).
