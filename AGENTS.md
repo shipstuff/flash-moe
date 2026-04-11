@@ -24,6 +24,12 @@
 - Temporal expert prediction (`--predict`) — functional, but a net regression
   (~26% hit rate, -58% speed)
 - Per-layer timing breakdown (`--timing`)
+- **Batch prefill (`--batch-prefill T`) — WORKS end-to-end as of 2026-04-11.**
+  Processes T prompt tokens per layer call, amortizing expert I/O across T tokens.
+  T=1/4/8 produce identical token sequences (validated on clockmaker prompt).
+  Cold-cache first chunk: 2.35x speedup (T=4 265ms vs T=1 622ms for 15-tok prompt).
+  Warm-cache prefill per-token is slower due to per-token GPU cmd buffer overhead.
+  See `dispatch_experts_sparse` aliasing bug fix note in "Common Errors" below.
 
 ### HTTP Server Mode (`--serve PORT`)
 - OpenAI-compatible `/v1/chat/completions` API
@@ -303,6 +309,15 @@ If you see `expert_index.json` size is not equal to `EXPERT_SIZE` constant in `i
 ### `malloc_cache_insert`: wrong entry evicted
 The LRU eviction bug - `entry_idx` cleared before telemetry call, so wrong entry tracked as evicted. Fixed in `8f76d02`.
 
+### `dispatch_experts_sparse`: wrong Metal buffer aliasing (FIXED 2026-04-11)
+`dispatch_experts_sparse` pread'd expert data into `buf_multi_expert_data[0]` then called
+`gpu_expert_forward(..., already_in_buffer=1)`. But `gpu_expert_forward` ALWAYS reads its
+weight matrices from `buf_expert_data` — not `buf_multi_expert_data[0]`. With
+`already_in_buffer=1`, the copy step was skipped, so the GPU used stale data from the
+previous call. This caused all T>1 batched tokens to produce garbage hidden states.
+Fix: pass `already_in_buffer=(s > 0)` — copy on first token (s==0), reuse on subsequent
+tokens of the same unique expert (s>0). Fixed in `c08cf07` (integration-batch-prefill branch).
+
 ---
 
-*Last verified: 2026-04-10. CLI hang is active - check "What's Broken" before running.*
+*Last verified: 2026-04-11. CLI hang is active - check "What's Broken" before running.*
