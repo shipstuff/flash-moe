@@ -89,3 +89,55 @@ The **highest expected ROI for the smallest scope** is option 1 (batched project
 If that succeeds and we want more, option 3 (sparse MoE) is the biggest single-component win and unblocks larger T values for future stages.
 
 **Decision needed:** commit to option 1 as a focused day-scale task, OR defer batch prefill to a separate planning cycle and pick a different "higher value" target now.
+
+---
+
+## 2026-04-11 update
+
+The three batched primitives **all exist on main** with passing synthetic tests:
+- `dequant_matmul_4bit` Metal kernel (Option 1, commit `6ae50c6`)
+- `attn_*_batched_T` Metal kernels with causal mask (Option 2, commit `9e01863`)
+- `dispatch_experts_sparse` C function (Option 3, commit `a0bc022`)
+
+A `fused_layer_forward_batch(T, ...)` scaffolding function and a
+`--batch-prefill T` CLI flag are also in place (commit `19fc94a`). The
+current stub implementation just loops the per-token `fused_layer_forward`
+T times with `complete_deferred_experts()` between each call to avoid
+clobbering the GPU pipeline state. This is **bit-for-bit equivalent** to
+the per-token path (verified with the same prompt across `--batch-prefill`
+1, 4, and 8 — same generated token IDs).
+
+**Stub overhead measurement (45-token prompt):**
+| Path | prefill ms/token | gen tok/s |
+|---|---|---|
+| `--batch-prefill 1` (per-token) | 179 ms | 5.73 |
+| `--batch-prefill 4` (stub T=4)  | 230 ms (+28%) | 6.12 |
+
+The stub is ~28% **slower** because every per-token call inside the
+batched outer loop pays the cost of `complete_deferred_experts` and the
+cmd3↔cmd1 pipelining (which the per-token loop relies on for back-to-back
+layer overlap) is broken across token boundaries.
+
+**To get a real speedup the stub must be replaced with a from-scratch
+`fused_layer_forward_batch` that uses the batched primitives natively.**
+That is the multi-day refactor estimated above. The component primitives
+are ready; only the integration work remains. Suggested next stages, in
+order:
+
+1. **Buffer + helper plumbing** — `buf_input_batch[T,HIDDEN_DIM]`,
+   `buf_qkv_batch_*`, and a `gpu_encode_batch_matmul_T()` helper that
+   wraps `dequant_matmul_4bit` for T-input projections.
+2. **Stage 1 — full-attention path** — q/k/v projections via
+   `dequant_matmul_4bit`, batched RoPE + Q/K RMS norm (CPU loop, T is
+   small), KV cache T-position append, batched attention via the
+   Option 2 kernels, batched o_proj, per-token routing, sparse MoE
+   via Option 3, per-token combine. Linear-attention layers stay on
+   the per-token fallback (delta-net is stateful).
+3. **Validation** — `--test-batch-prefill` harness that runs T=1 and
+   T=N on the same prompt and diffs the per-layer hidden hashes (the
+   approach used for the TQ debugging). MUST be in place before each
+   stage to catch regressions early.
+4. **Real-model benchmark** — same long-context sweep as the TQ work
+   (1k, 2k, 3k contexts). Compare wall-time prefill against
+   `--batch-prefill 1`.
+
