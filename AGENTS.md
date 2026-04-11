@@ -24,12 +24,19 @@
 - Temporal expert prediction (`--predict`) — functional, but a net regression
   (~26% hit rate, -58% speed)
 - Per-layer timing breakdown (`--timing`)
-- **Batch prefill (`--batch-prefill T`) — WORKS end-to-end as of 2026-04-11.**
+- **Batch prefill (`--batch-prefill T`) — COLD-CACHE-ONLY as of 2026-04-11.**
   Processes T prompt tokens per layer call, amortizing expert I/O across T tokens.
-  T=1/4/8 produce identical token sequences (validated on clockmaker prompt).
+  Correctness validated: T=1/4/8 bit-identical tokens on 18 and 138-token prompts. ✅
   Cold-cache first chunk: 2.35x speedup (T=4 265ms vs T=1 622ms for 15-tok prompt).
-  Warm-cache prefill per-token is slower due to per-token GPU cmd buffer overhead.
-  See `dispatch_experts_sparse` aliasing bug fix note in "Common Errors" below.
+  **Warm-cache wall-time is a REGRESSION at long prompts**: at 138 tok prompt,
+  T=4 is +57% slower than T=1 (236 vs 150 ms rest-avg). Root cause: the loop
+  inversion (layers outside, tokens inside) breaks the CMD3↔CMD1 pipelining
+  that per-token prefill relies on, and 45/60 linear-attention layers fall
+  through to a sequential path with `complete_deferred_experts()` between
+  tokens. See `docs/2026-04-11-batch-prefill-scoping.md` afternoon update for
+  the full trace and the two refactor approaches (multi-buffered deferred
+  state, MoE cross-token decoupling). Flag is opt-in — default stays T=1.
+  See also `dispatch_experts_sparse` aliasing bug fix note in "Common Errors".
 
 ### HTTP Server Mode (`--serve PORT`)
 - OpenAI-compatible `/v1/chat/completions` API
