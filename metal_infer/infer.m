@@ -6562,6 +6562,64 @@ static void fused_layer_forward(
 }
 
 // ============================================================================
+// fused_layer_forward_batch — process T prompt tokens through ONE layer
+// ============================================================================
+//
+// Used by the batched prefill path. The semantics match calling
+// fused_layer_forward T times in sequence with hidden_batch[t] and pos_start+t.
+//
+// Implementation strategy: incremental.  Stage 0 is the dumb sequential
+// fallback — call fused_layer_forward T times.  This makes the function
+// drop-in correct so we can wire the prefill loop to it and validate that
+// the hidden-state hashes still match the per-token reference.  Subsequent
+// stages will replace components one at a time:
+//
+//   Stage 1: batched q/k/v/o projections via dequant_matmul_4bit
+//   Stage 2: batched float-KV attention via attn_*_batched_T
+//   Stage 3: sparse MoE dispatch via dispatch_experts_sparse
+//
+// Linear-attention layers stay sequential (the delta-net recurrence is
+// stateful so we can't trivially batch across T).
+//
+// hidden_batch is [T * HIDDEN_DIM] row-major float, in/out.
+// kv must be a single per-layer cache used for all T positions.
+// pos_start is the position of hidden_batch[0]; subsequent tokens use
+// pos_start+1, +2, ... +T-1.
+// ============================================================================
+static void fused_layer_forward_batch(
+    WeightFile *wf,
+    int layer_idx,
+    float *hidden_batch,    // [T, HIDDEN_DIM] in/out
+    int T,
+    KVCache *kv,
+    LinearAttnState *la_state,
+    int pos_start,
+    const void *mmap_base,
+    int K,
+    int packed_fd
+) {
+    // Stage 0 fallback: call the per-token path T times.  fused_layer_forward
+    // defers the expert MoE compute and writes back to g_deferred.hidden in
+    // the next call's fast path.  In the per-token prefill loop the next
+    // call's hidden pointer is the SAME chain (same token, next layer), so
+    // the fast path reuses buf_input correctly.  Here the next call is a
+    // DIFFERENT token at the SAME layer, so the fast path would corrupt
+    // buf_input.  Worse, simply discarding the deferred state would leave
+    // the previous token's hidden incomplete (no MoE combine applied).
+    // We need complete_deferred_experts() between per-token calls — wait,
+    // apply the combine, write back to the saved hidden pointer, clear state.
+    // This loses the cmd3<->cmd1 pipeline benefit but is the only correct
+    // composition of the existing per-token function in a batched outer loop.
+    for (int t = 0; t < T; t++) {
+        if (g_deferred.active) {
+            complete_deferred_experts();
+        }
+        fused_layer_forward(wf, layer_idx, hidden_batch + (size_t)t * HIDDEN_DIM,
+                            kv, la_state, pos_start + t, mmap_base, K, packed_fd);
+    }
+}
+
+// ============================================================================
 // Main inference loop
 // ============================================================================
 
@@ -8053,6 +8111,7 @@ int main(int argc, char **argv) {
         const char *batch_attn_arg = NULL;  // --test-batch-attn T,kv_len
 
         const char *sparse_moe_arg = NULL;  // --test-sparse-moe T,overlap
+        int batch_prefill_T = 1;  // --batch-prefill T : group T prompt tokens per fused_layer_forward_batch call
         static struct option long_options[] = {
             {"model",             required_argument, 0, 'm'},
             {"weights",           required_argument, 0, 'w'},
@@ -8078,12 +8137,13 @@ int main(int argc, char **argv) {
             {"test-batch-matmul", required_argument, 0, 'X'},
             {"test-batch-attn",   required_argument, 0, 'A'},
             {"test-sparse-moe",   required_argument, 0, 'Y'},
+            {"batch-prefill",     required_argument, 0, 'Q'},
             {"help",              no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:A:X:Y:LSTFE2GDHh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:A:X:Y:Q:LSTFE2GDHh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -8116,6 +8176,15 @@ int main(int argc, char **argv) {
                 case 'R': serve_port = atoi(optarg); break;
                 case 'X': test_batch_matmul_arg = optarg; break;
                 case 'Y': sparse_moe_arg = optarg; break;
+                case 'Q':
+                    batch_prefill_T = atoi(optarg);
+                    if (batch_prefill_T < 1) batch_prefill_T = 1;
+                    if (batch_prefill_T > MAX_BATCH_T) {
+                        fprintf(stderr, "[batch-prefill] capping T=%d to MAX_BATCH_T=%d\n",
+                                batch_prefill_T, MAX_BATCH_T);
+                        batch_prefill_T = MAX_BATCH_T;
+                    }
+                    break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -8465,44 +8534,89 @@ int main(int argc, char **argv) {
         // This is safe because the hidden state from intermediate prefill tokens
         // is immediately overwritten by the next token's embedding — the recurrent
         // state (KV cache, delta-net state) is already updated inside fused_layer_forward.
+        //
+        // batch_prefill_T (--batch-prefill flag, default 1) groups tokens into
+        // chunks of T and runs them together via fused_layer_forward_batch.
+        // The last token of the prompt is always processed separately (we need
+        // its hidden state for the lm_head).
         if (pt->count > 1) {
             double t_prefill_batch = now_ms();
             double first_tok_ms = 0;
+            int intermediate_count = pt->count - 1;
 
-            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
-                double t_tok = now_ms();
+            if (batch_prefill_T > 1) {
+                // Chunked prefill: run T tokens together per layer.
+                // Allocate a (T, HIDDEN_DIM) scratch we can reuse across chunks.
+                float *hidden_chunk = malloc((size_t)batch_prefill_T * HIDDEN_DIM * sizeof(float));
+                int processed = 0;
+                while (processed < intermediate_count) {
+                    int T_now = intermediate_count - processed;
+                    if (T_now > batch_prefill_T) T_now = batch_prefill_T;
+                    double t_chunk = now_ms();
 
-                // Load pre-embedded token from batch buffer
-                cache_telemetry_note_token();
-                memcpy(hidden, embed_batch + (size_t)token_idx * HIDDEN_DIM,
-                       HIDDEN_DIM * sizeof(float));
+                    // Load T pre-embedded tokens
+                    for (int t = 0; t < T_now; t++) {
+                        cache_telemetry_note_token();
+                    }
+                    memcpy(hidden_chunk,
+                           embed_batch + (size_t)processed * HIDDEN_DIM,
+                           (size_t)T_now * HIDDEN_DIM * sizeof(float));
 
-                // Run through all 60 transformer layers
-                for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
-                    fused_layer_forward(wf, layer, hidden,
-                                        is_full ? kv_caches[layer] : NULL,
-                                        is_full ? NULL : layer_states[layer],
-                                        pos,
-                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                        K, layer_fds[layer]);
+                    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        fused_layer_forward_batch(wf, layer, hidden_chunk, T_now,
+                                                  is_full ? kv_caches[layer] : NULL,
+                                                  is_full ? NULL : layer_states[layer],
+                                                  pos,
+                                                  layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                                  K, layer_fds[layer]);
+                    }
+                    discard_deferred_experts();
+                    pos += T_now;
+
+                    double t_chunk_end = now_ms();
+                    if (processed == 0) first_tok_ms = (t_chunk_end - t_chunk) / T_now;
+                    processed += T_now;
                 }
+                free(hidden_chunk);
+            } else {
+                // Original per-token loop
+                for (int token_idx = 0; token_idx < intermediate_count; token_idx++) {
+                    double t_tok = now_ms();
 
-                // Discard last layer's expert output — hidden will be overwritten
-                // by the next token's embedding. Only wait for GPU (buffer safety).
-                discard_deferred_experts();
-                pos++;
+                    // Load pre-embedded token from batch buffer
+                    cache_telemetry_note_token();
+                    memcpy(hidden, embed_batch + (size_t)token_idx * HIDDEN_DIM,
+                           HIDDEN_DIM * sizeof(float));
 
-                if (token_idx == 0) {
-                    first_tok_ms = now_ms() - t_tok;
+                    // Run through all 60 transformer layers
+                    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        fused_layer_forward(wf, layer, hidden,
+                                            is_full ? kv_caches[layer] : NULL,
+                                            is_full ? NULL : layer_states[layer],
+                                            pos,
+                                            layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                            K, layer_fds[layer]);
+                    }
+
+                    // Discard last layer's expert output — hidden will be overwritten
+                    // by the next token's embedding. Only wait for GPU (buffer safety).
+                    discard_deferred_experts();
+                    pos++;
+
+                    if (token_idx == 0) {
+                        first_tok_ms = now_ms() - t_tok;
+                    }
                 }
             }
 
             double prefill_batch_ms = now_ms() - t_prefill_batch;
             double avg_ms = (pt->count > 2) ?
                 (prefill_batch_ms - first_tok_ms) / (pt->count - 2) : first_tok_ms;
-            printf("  [prefill] %d/%d tokens: %.0f ms (first: %.0f ms, rest avg: %.0f ms)\n",
-                   pt->count - 1, pt->count, prefill_batch_ms, first_tok_ms, avg_ms);
+            printf("  [prefill] %d/%d tokens: %.0f ms (first: %.0f ms, rest avg: %.0f ms)%s\n",
+                   pt->count - 1, pt->count, prefill_batch_ms, first_tok_ms, avg_ms,
+                   batch_prefill_T > 1 ? "  [batched]" : "");
         }
 
         // ---- Last prefill token (or single-token prompt) ----
