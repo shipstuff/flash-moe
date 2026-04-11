@@ -1038,8 +1038,10 @@ typedef struct {
     id<MTLBuffer> buf_tq_inv_rot;     // [HEAD_DIM * HEAD_DIM] float32 — Pi^T
     id<MTLBuffer> buf_tq_encode_k;    // [NUM_KV_HEADS * HEAD_DIM] fp32
     id<MTLBuffer> buf_tq_encode_v;    // [NUM_KV_HEADS * HEAD_DIM] fp32
-    id<MTLBuffer> buf_tq_encode_k_norms; // [NUM_KV_HEADS] fp32
-    id<MTLBuffer> buf_tq_encode_v_norms; // [NUM_KV_HEADS] fp32
+    // (removed: buf_tq_encode_*_norms — leftovers from an abandoned design
+    //  that precomputed K/V L2 norms on the CPU. tq_pack_update computes
+    //  norms on the GPU via simd_sum and writes them straight into the
+    //  persistent per-position cache buf_tq_{k,v}_norms[fa_idx].)
     id<MTLComputePipelineState> tq_fused_attn_pipe;
     id<MTLComputePipelineState> tq_encode_pipe;
     id<MTLComputePipelineState> tq_pack_update_pipe;
@@ -1318,10 +1320,6 @@ static MetalCtx *metal_setup(void) {
                                                             options:MTLResourceStorageModeShared];
             ctx->buf_tq_encode_v = [ctx->device newBufferWithLength:NUM_KV_HEADS * HEAD_DIM * sizeof(float)
                                                             options:MTLResourceStorageModeShared];
-            ctx->buf_tq_encode_k_norms = [ctx->device newBufferWithLength:NUM_KV_HEADS * sizeof(float)
-                                                                   options:MTLResourceStorageModeShared];
-            ctx->buf_tq_encode_v_norms = [ctx->device newBufferWithLength:NUM_KV_HEADS * sizeof(float)
-                                                                   options:MTLResourceStorageModeShared];
 
             // Temporal hedge: second command queue for racing identical dispatches
             if (g_hedge_enabled) {
