@@ -5435,41 +5435,18 @@ static void fused_layer_forward(
                    v_out, kv_dim * sizeof(float));
         }
 
-        // TurboQuant KV cache update — compress and append to compressed cache
+        // TurboQuant KV cache update — stage this token's raw K/V into encode
+        // scratch buffers. The actual tq_pack_update Metal kernel dispatch has
+        // been MERGED into cmd_fused below (see the TQ attention block around
+        // line ~5800). Keeping the dispatch here would cost an extra commit+wait
+        // round-trip per full-attention layer; merging saves ~2 commit+waits
+        // per layer (previously one for tq_pack_update and one for
+        // tq_fused_attention, both now encoded into the same cmd_fused buffer).
         if (g_metal && g_metal->use_tq_kv && g_metal->tq_pack_update_pipe) {
-            uint32_t pos32 = (uint32_t)cache_pos;
-            uint32_t GPU_TQ_SEQ32 = GPU_TQ_SEQ;
-            // Stage this token's K and V into the small encode scratch (the
-            // kernel computes norms itself via simd_sum across HEAD_DIM lanes,
-            // so we don't need CPU precomputation).
             float *encode_k = (float *)[g_metal->buf_tq_encode_k contents];
             float *encode_v = (float *)[g_metal->buf_tq_encode_v contents];
             memcpy(encode_k, k_out, NUM_KV_HEADS * HEAD_DIM * sizeof(float));
             memcpy(encode_v, v_out, NUM_KV_HEADS * HEAD_DIM * sizeof(float));
-
-            id<MTLCommandBuffer> tq_cmd = [g_metal->queue commandBuffer];
-            id<MTLComputeCommandEncoder> tq_enc = [tq_cmd computeCommandEncoder];
-            [tq_enc setComputePipelineState:g_metal->tq_pack_update_pipe];
-            // Match tq_pack_update kernel signature:
-            //   0: k_new            1: v_new          2: rotation_matrix
-            //   3: k_packed_out     4: k_norms_out    5: v_packed_out
-            //   6: v_norms_out      7: pos            8: GPU_TQ_SEQ
-            // The norms-out buffers MUST be the persistent per-position caches
-            // that tq_fused_attention reads later — not the encode scratch.
-            [tq_enc setBuffer:g_metal->buf_tq_encode_k         offset:0 atIndex:0];
-            [tq_enc setBuffer:g_metal->buf_tq_encode_v         offset:0 atIndex:1];
-            [tq_enc setBuffer:g_metal->buf_tq_rot              offset:0 atIndex:2];
-            [tq_enc setBuffer:g_metal->buf_tq_k_packed[fa_idx] offset:0 atIndex:3];
-            [tq_enc setBuffer:g_metal->buf_tq_k_norms[fa_idx]  offset:0 atIndex:4];
-            [tq_enc setBuffer:g_metal->buf_tq_v_packed[fa_idx] offset:0 atIndex:5];
-            [tq_enc setBuffer:g_metal->buf_tq_v_norms[fa_idx]  offset:0 atIndex:6];
-            [tq_enc setBytes:&pos32        length:4 atIndex:7];
-            [tq_enc setBytes:&GPU_TQ_SEQ32 length:4 atIndex:8];
-            [tq_enc dispatchThreadgroups:MTLSizeMake(NUM_KV_HEADS * TQ_WORDS_PER_HEAD, 1, 1)
-                      threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-            [tq_enc endEncoding];
-            [tq_cmd commit];
-            [tq_cmd waitUntilCompleted];
         }
 
         kv->len++;
@@ -5798,13 +5775,42 @@ static void fused_layer_forward(
             uint32_t seq_stride = GPU_KV_SEQ;
             uint32_t hpkv = (uint32_t)heads_per_kv;
 
-            // TurboQuant fused attention: 1 dispatch instead of 3 (Enc A1+A2+A3)
+            // TurboQuant fused attention: 1 dispatch instead of 3 (Enc A1+A2+A3).
+            // tq_pack_update is also merged in (writes the per-position TQ
+            // caches that tq_fused_attention reads — Metal guarantees in-order
+            // execution of compute encoders within a single command buffer, so
+            // no explicit sync needed). This replaces two separate commit+wait
+            // round-trips with zero additional round-trips (encoders ride
+            // along on the cmd_fused commit at the end of the layer).
             if (g_metal->use_tq_kv && g_metal->tq_fused_attn_pipe) {
                 uint32_t T_kv32 = sl;
                 uint32_t causal_offset32 = 0;
                 uint32_t GPU_TQ_SEQ32 = GPU_TQ_SEQ;
-                id<MTLCommandBuffer> cmd_tq = [g_metal->queue commandBuffer];
-                id<MTLComputeCommandEncoder> enc = [cmd_tq computeCommandEncoder];
+
+                // ---- Encoder TQ_PACK: merge tq_pack_update into cmd_fused ----
+                // cache_pos is out of scope here (it was local to the is_full
+                // CPU block); re-derive from kv->len (which has already been
+                // incremented to include the current token).
+                if (g_metal->tq_pack_update_pipe) {
+                    uint32_t pos32 = (uint32_t)(kv->len - 1);
+                    id<MTLComputeCommandEncoder> tq_pack_enc = [cmd_fused computeCommandEncoder];
+                    [tq_pack_enc setComputePipelineState:g_metal->tq_pack_update_pipe];
+                    [tq_pack_enc setBuffer:g_metal->buf_tq_encode_k         offset:0 atIndex:0];
+                    [tq_pack_enc setBuffer:g_metal->buf_tq_encode_v         offset:0 atIndex:1];
+                    [tq_pack_enc setBuffer:g_metal->buf_tq_rot              offset:0 atIndex:2];
+                    [tq_pack_enc setBuffer:g_metal->buf_tq_k_packed[fa_idx] offset:0 atIndex:3];
+                    [tq_pack_enc setBuffer:g_metal->buf_tq_k_norms[fa_idx]  offset:0 atIndex:4];
+                    [tq_pack_enc setBuffer:g_metal->buf_tq_v_packed[fa_idx] offset:0 atIndex:5];
+                    [tq_pack_enc setBuffer:g_metal->buf_tq_v_norms[fa_idx]  offset:0 atIndex:6];
+                    [tq_pack_enc setBytes:&pos32        length:4 atIndex:7];
+                    [tq_pack_enc setBytes:&GPU_TQ_SEQ32 length:4 atIndex:8];
+                    [tq_pack_enc dispatchThreadgroups:MTLSizeMake(NUM_KV_HEADS * TQ_WORDS_PER_HEAD, 1, 1)
+                                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    [tq_pack_enc endEncoding];
+                }
+
+                // ---- Encoder TQ_ATTN: tq_fused_attention on cmd_fused ----
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->tq_fused_attn_pipe];
                 [enc setBuffer:g_metal->buf_attn_q                                    offset:0 atIndex:0];
                 [enc setBuffer:g_metal->buf_attn_gate                                 offset:0 atIndex:1];
@@ -5821,17 +5827,16 @@ static void fused_layer_forward(
                 [enc dispatchThreadgroups:MTLSizeMake(NUM_ATTN_HEADS * 256, 1, 1)
                           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
-                CFAbsoluteTime t_tq_start = CFAbsoluteTimeGetCurrent();
-                [cmd_tq commit];
-                [cmd_tq waitUntilCompleted];
-                double tq_elapsed = (CFAbsoluteTimeGetCurrent() - t_tq_start) * 1000.0;
-                if (g_timing_enabled) {
-                    g_timing.tq_kernel_time += tq_elapsed;
-                    if (g_tq_sample_count < TQ_HIST_MAX)
-                        g_tq_samples[g_tq_sample_count++] = (float)tq_elapsed;
-                }
+                // No cmd_tq commit/wait — merged into cmd_fused at end of layer.
+                // tq_kernel_time is now part of total_layer (no way to isolate
+                // a single kernel's GPU time without MTLCounterSampleBuffer).
+
                 // Temporal hedge: duplicate the exact same kernel on a second queue.
                 // Both read identical addresses; whichever queue finishes first wins.
+                // NOTE: in the merged path this hedge no longer serves its original
+                // purpose (we don't wait on the primary dispatch before moving on),
+                // but the hedge is off by default (disabled due to proven regression)
+                // so we leave the code here gated by g_hedge_enabled for reference.
                 if (g_hedge_enabled && g_hedge_queue1) {
                     CFAbsoluteTime t_hedge_start = CFAbsoluteTimeGetCurrent();
                     id<MTLCommandBuffer> cmd_hedge = [g_hedge_queue1 commandBuffer];
@@ -5858,9 +5863,11 @@ static void fused_layer_forward(
                     [cmd_hedge commit];
                     [cmd_hedge waitUntilCompleted];
                     double hedge_elapsed = (CFAbsoluteTimeGetCurrent() - t_hedge_start) * 1000.0;
-                    double effective = (tq_elapsed < hedge_elapsed) ? tq_elapsed : hedge_elapsed;
+                    // Note: in the merged path the primary tq_fused_attention
+                    // is encoded into cmd_fused (not a standalone cmd_tq) so
+                    // we can't isolate its kernel time. Record hedge time only.
                     if (g_timing_enabled && g_tq_sample_count < TQ_HIST_MAX)
-                        g_tq_samples[g_tq_sample_count++] = (float)effective;
+                        g_tq_samples[g_tq_sample_count++] = (float)hedge_elapsed;
                 }
             } else {
                 // Enc A1: attn_scores_batched
