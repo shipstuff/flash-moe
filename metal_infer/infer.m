@@ -185,6 +185,25 @@ static uint64_t g_pred_hits = 0;
 static uint64_t g_pred_misses = 0;
 static uint64_t g_pred_layers = 0;
 
+// TQ debugging — gated by TQ_KV_DBG=1, prints per-layer hashes during generation
+// to find where TQ-enabled inference diverges from baseline.
+static int g_tq_dbg = 0;
+static inline uint64_t tq_dbg_hash_floats(const float *p, int n) {
+    // Cheap deterministic hash of a float vector — XOR of FNV-1a-folded bits.
+    uint64_t h = 1469598103934665603ULL;  // FNV offset basis
+    const uint32_t *u = (const uint32_t *)p;
+    for (int i = 0; i < n; i++) {
+        h ^= (uint64_t)u[i];
+        h *= 1099511628211ULL;             // FNV prime
+    }
+    return h;
+}
+static inline float tq_dbg_l2(const float *p, int n) {
+    double s = 0.0;
+    for (int i = 0; i < n; i++) s += (double)p[i] * (double)p[i];
+    return (float)sqrt(s);
+}
+
 // Routing data collection for training an expert predictor
 // Binary format per sample: int32 layer_idx, int32 K, float32[4096] hidden, int32[K] expert_indices
 static FILE *g_routing_log = NULL;
@@ -1253,17 +1272,27 @@ static MetalCtx *metal_setup(void) {
             fprintf(stderr, "[metal] TQ_KV=1 but TurboQuant pipelines unavailable -- falling back\n");
             ctx->use_tq_kv = 0;
         }
-        // TurboQuant partial fixes applied 2026-04-10 but KV compression is
-        // still incorrect — diverges from the baseline CPU attention path
-        // starting at the generation step where the CPU KV cache first differs,
-        // suggesting either a memory-bounds issue in the TQ kernels or an
-        // aliasing bug in the shared Metal buffers. Until that is root-caused
-        // and fixed, TQ_KV=1 defaults to the float KV fallback and produces
-        // coherent output. Set TQ_KV_FORCE=1 to opt into the still-broken path.
-        // See benchmarks/2026-04-10-post-repack-e2e.md for the full list of
-        // TQ shader bugs (Gram-Schmidt, Phase 3/4, quantization scale).
-        if (ctx->use_tq_kv && !(getenv("TQ_KV_FORCE") && atoi(getenv("TQ_KV_FORCE")) == 1)) {
-            fprintf(stderr, "[metal] TQ_KV=1: TurboQuant is KNOWN BROKEN (multiple shader bugs, see benchmarks/2026-04-10-post-repack-e2e.md) -- forcing float KV fallback for coherent output. Set TQ_KV_FORCE=1 to run the broken path anyway.\n");
+        // TurboQuant fixes complete 2026-04-11. Path is now correct end-to-end:
+        //   - Gram-Schmidt rotation matrix (Pi orthonormal)
+        //   - Phase 3/4 of tq_fused_attention (broadcast global softmax;
+        //     proper inverse rotation as a matrix-vector product)
+        //   - sqrt(HEAD_DIM) scale at encode and decode so 2-bit centroids
+        //     match the per-dim distribution of (Pi·k)/||k||
+        //   - Pre-rotate Q on the CPU before the kernel reads buf_attn_q so
+        //     dot(Q_rot, K_rot) collapses to dot(Q, K) under orthonormal Pi
+        //   - Removed double-application of sigmoid gate (was once in shader
+        //     Phase 5 and once in cmd_fused's sigmoid_gate kernel)
+        //   - Fixed kv_head=1 norm-write (was guarded by `if (tgid == 0)`
+        //     which only fired for kv_head=0)
+        //   - **CRITICAL**: tq_pack_update dispatch was binding the per-step
+        //     scratch buffers buf_tq_encode_{k,v}_norms to atIndex 4/6 instead
+        //     of the persistent per-position cache buf_tq_{k,v}_norms[fa_idx]
+        //     that tq_fused_attention reads. As a result the persistent norms
+        //     cache stayed all zeros and every TQ-decoded value was zero, so
+        //     the attention contribution vanished. Now bound correctly.
+        // Set TQ_KV_SAFE=1 to fall back to float KV (e.g. for A/B comparisons).
+        if (ctx->use_tq_kv && getenv("TQ_KV_SAFE") && atoi(getenv("TQ_KV_SAFE")) == 1) {
+            fprintf(stderr, "[metal] TQ_KV_SAFE=1 — falling back to float KV cache.\n");
             ctx->use_tq_kv = 0;
         }
 
@@ -4705,36 +4734,33 @@ static void fused_layer_forward(
 
         // TurboQuant KV cache update — compress and append to compressed cache
         if (g_metal && g_metal->use_tq_kv && g_metal->tq_pack_update_pipe) {
-            int tq_fa_idx = fa_idx;
             uint32_t pos32 = (uint32_t)cache_pos;
             uint32_t GPU_TQ_SEQ32 = GPU_TQ_SEQ;
+            // Stage this token's K and V into the small encode scratch (the
+            // kernel computes norms itself via simd_sum across HEAD_DIM lanes,
+            // so we don't need CPU precomputation).
             float *encode_k = (float *)[g_metal->buf_tq_encode_k contents];
             float *encode_v = (float *)[g_metal->buf_tq_encode_v contents];
-            float *encode_k_norms = (float *)[g_metal->buf_tq_encode_k_norms contents];
-            float *encode_v_norms = (float *)[g_metal->buf_tq_encode_v_norms contents];
             memcpy(encode_k, k_out, NUM_KV_HEADS * HEAD_DIM * sizeof(float));
             memcpy(encode_v, v_out, NUM_KV_HEADS * HEAD_DIM * sizeof(float));
-            for (int kv_h = 0; kv_h < NUM_KV_HEADS; kv_h++) {
-                float k_sq = 0.0f, v_sq = 0.0f;
-                for (int d = 0; d < HEAD_DIM; d++) {
-                    float kd = encode_k[kv_h * HEAD_DIM + d];
-                    float vd = encode_v[kv_h * HEAD_DIM + d];
-                    k_sq += kd * kd; v_sq += vd * vd;
-                }
-                encode_k_norms[kv_h] = sqrtf(k_sq + RMS_NORM_EPS);
-                encode_v_norms[kv_h] = sqrtf(v_sq + RMS_NORM_EPS);
-            }
+
             id<MTLCommandBuffer> tq_cmd = [g_metal->queue commandBuffer];
             id<MTLComputeCommandEncoder> tq_enc = [tq_cmd computeCommandEncoder];
             [tq_enc setComputePipelineState:g_metal->tq_pack_update_pipe];
-            [tq_enc setBuffer:g_metal->buf_tq_encode_k offset:0 atIndex:0];
-            [tq_enc setBuffer:g_metal->buf_tq_encode_v offset:0 atIndex:1];
-            [tq_enc setBuffer:g_metal->buf_tq_rot offset:0 atIndex:2];
+            // Match tq_pack_update kernel signature:
+            //   0: k_new            1: v_new          2: rotation_matrix
+            //   3: k_packed_out     4: k_norms_out    5: v_packed_out
+            //   6: v_norms_out      7: pos            8: GPU_TQ_SEQ
+            // The norms-out buffers MUST be the persistent per-position caches
+            // that tq_fused_attention reads later — not the encode scratch.
+            [tq_enc setBuffer:g_metal->buf_tq_encode_k         offset:0 atIndex:0];
+            [tq_enc setBuffer:g_metal->buf_tq_encode_v         offset:0 atIndex:1];
+            [tq_enc setBuffer:g_metal->buf_tq_rot              offset:0 atIndex:2];
             [tq_enc setBuffer:g_metal->buf_tq_k_packed[fa_idx] offset:0 atIndex:3];
-            [tq_enc setBuffer:g_metal->buf_tq_encode_k_norms offset:0 atIndex:4];
+            [tq_enc setBuffer:g_metal->buf_tq_k_norms[fa_idx]  offset:0 atIndex:4];
             [tq_enc setBuffer:g_metal->buf_tq_v_packed[fa_idx] offset:0 atIndex:5];
-            [tq_enc setBuffer:g_metal->buf_tq_encode_v_norms offset:0 atIndex:6];
-            [tq_enc setBytes:&pos32 length:4 atIndex:7];
+            [tq_enc setBuffer:g_metal->buf_tq_v_norms[fa_idx]  offset:0 atIndex:6];
+            [tq_enc setBytes:&pos32        length:4 atIndex:7];
             [tq_enc setBytes:&GPU_TQ_SEQ32 length:4 atIndex:8];
             [tq_enc dispatchThreadgroups:MTLSizeMake(NUM_KV_HEADS * TQ_WORDS_PER_HEAD, 1, 1)
                       threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -4759,7 +4785,29 @@ static void fused_layer_forward(
 
         if (gpu_attn_ready) {
             // Copy Q and gate to GPU; attention dispatches will be in CMD2
-            memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
+            if (g_metal->use_tq_kv) {
+                // TurboQuant stores K_rot=Pi@K and V_rot=Pi@V in the compressed
+                // KV cache. To get the correct dot product against the rotated K
+                // we need Q in the same basis:
+                //   dot(Pi@Q, Pi@K) = Q^T (Pi^T Pi) K = Q^T K  (Pi orthonormal)
+                // So pre-rotate Q per attention head before the memcpy. The
+                // q_gate path is unchanged — it does NOT participate in the
+                // dot product, so it stays in the original basis.
+                const float *Pi = (const float *)[g_metal->buf_tq_rot contents];
+                float *qbuf = (float *)[g_metal->buf_attn_q contents];
+                for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+                    const float *qh = q + h * HEAD_DIM;
+                    float       *qo = qbuf + h * HEAD_DIM;
+                    for (int d = 0; d < HEAD_DIM; d++) {
+                        float s = 0.0f;
+                        const float *row = Pi + d * HEAD_DIM;
+                        for (int j = 0; j < HEAD_DIM; j++) s += row[j] * qh[j];
+                        qo[d] = s;
+                    }
+                }
+            } else {
+                memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
+            }
             memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
         } else {
@@ -6807,6 +6855,8 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
+        // TQ debug instrumentation toggle (per-layer hidden hash + KV cache hash)
+        if (getenv("TQ_KV_DBG") && atoi(getenv("TQ_KV_DBG")) == 1) g_tq_dbg = 1;
         const char *model_path = MODEL_PATH_DEFAULT;
         const char *weights_path = NULL;
         const char *manifest_path = NULL;
@@ -7327,6 +7377,26 @@ int main(int argc, char **argv) {
                                     pos,
                                     layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                     K, layer_fds[layer]);
+                if (g_tq_dbg) {
+                    // Force completion of any deferred GPU work so the CPU read
+                    // we're about to do reflects this layer's output, not next.
+                    complete_deferred_experts();
+                    uint64_t hh = tq_dbg_hash_floats(hidden, HIDDEN_DIM);
+                    float    hl = tq_dbg_l2(hidden, HIDDEN_DIM);
+                    if (is_full) {
+                        // Hash this full-attn layer's CPU KV cache up to current pos+1
+                        KVCache *kvc = kv_caches[layer];
+                        int kv_dim = NUM_KV_HEADS * HEAD_DIM;
+                        int len = kvc->len;
+                        uint64_t kh = tq_dbg_hash_floats(kvc->k_cache, len * kv_dim);
+                        uint64_t vh = tq_dbg_hash_floats(kvc->v_cache, len * kv_dim);
+                        fprintf(stderr, "[tq_dbg] gen=%d L=%2d FULL  hidden_hash=%016llx l2=%.4f kv_len=%d k_hash=%016llx v_hash=%016llx\n",
+                                gen, layer, hh, hl, len, kh, vh);
+                    } else {
+                        fprintf(stderr, "[tq_dbg] gen=%d L=%2d lin   hidden_hash=%016llx l2=%.4f\n",
+                                gen, layer, hh, hl);
+                    }
+                }
             }
             // Complete last layer's deferred GPU experts before final norm
             complete_deferred_experts();

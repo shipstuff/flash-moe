@@ -16,8 +16,11 @@
 - Malloc-based expert LRU cache (`--malloc-cache N`) — lz4_comp_buf stack-init
   bug fixed 2026-04-10 (see below)
 - OS page cache for expert I/O — 32 GB/s sequential reads
-- TurboQuant KV-cache shaders compile; `TQ_KV=1` **safe-falls-back to float KV**
-  and produces coherent output (actual TQ attention is still broken — see below)
+- **TurboQuant KV-cache (`TQ_KV=1`) — WORKS end-to-end as of 2026-04-11.**
+  Coherent generation at 32 / 128 / 256+ tokens, 7.5x KV cache compression
+  (33.4 MB vs 252 MB at 8k context), ~12% generation slowdown at 128 tokens
+  from CPU Q rotation overhead (vectorizable). See below and the
+  `benchmarks/2026-04-10-post-repack-e2e.md` write-up.
 - Temporal expert prediction (`--predict`) — functional, but a net regression
   (~26% hit rate, -58% speed)
 - Per-layer timing breakdown (`--timing`)
@@ -27,14 +30,15 @@
 - System prompt prefilling + KV cache snapshots
 - Per-request timing
 
-### Benchmark Results (2026-04-10 overnight session, M4 Pro, post-repack)
+### Benchmark Results (2026-04-11 morning session, M4 Pro)
 All runs coherent output on "Once upon a time..." clockmaker prompt unless noted.
 ```
-no cache, 128tok, K=4:                   6.01 tok/s, TTFT 4311 ms, 104 coherent
-TQ_KV=1 (fallback), 128tok, K=4:         6.61 tok/s, TTFT 3883 ms, 104 coherent
-malloc-cache-64,  128tok, K=4:           6.13 tok/s, 0% hit (thrashing), coherent
-malloc-cache-512, 96tok,  K=4:           6.07 tok/s, 32.2% hit, coherent
---predict, 128tok, K=4:                  2.51 tok/s, 26% hit, coherent (-58%!)
+no cache,           128tok, K=4: 5.91 tok/s, 104 coherent (EOS at 104)
+TQ_KV=1 (fixed!),   128tok, K=4: 5.31 tok/s, 128 coherent, KV 33.4 MB (7.5x smaller)
+TQ_KV=1 (fixed!),   256tok, K=4: 5.15 tok/s, 256 coherent
+malloc-cache-64,    128tok, K=4: 6.13 tok/s, 0% hit (thrashing), coherent
+malloc-cache-512,    96tok, K=4: 6.07 tok/s, 32.2% hit, coherent
+--predict,          128tok, K=4: 2.51 tok/s, 26% hit, coherent (-58% net regression)
 ```
 Real baseline per-layer: expert_io=1.337ms, cmd1_wait=0.858ms,
 cmd2_wait=0.426ms, total_layer=2.703ms. This matches the "5.86 tok/s" reference
@@ -51,36 +55,6 @@ not-actually-doing-I/O path with garbage expert data. See the benchmark file
 ---
 
 ## What's Broken
-
-### TurboQuant attention (`TQ_KV=1`)
-- **Symptom:** With `TQ_KV_FORCE=1` (opt-in), output degrades to punctuation
-  garbage within ~15 generation steps once the GPU attention path engages
-- **Bugs identified and fixed (2026-04-10, shader still broken overall):**
-  1. Gram-Schmidt rotation matrix in `metal_setup()` was mixing row/column
-     indices — `buf_tq_rot` was not orthonormal. Fixed to standard row GS.
-  2. `tq_fused_attention` Phase 3 — `global_max`/`global_sum` computed only on
-     `lid==0` but used per-thread (other threads saw initial `-1e10`/`0`).
-     Fixed by broadcasting via `threadgroup float tg_global_max/tg_global_sum`.
-  3. `tq_fused_attention` Phase 4 — "inverse rotation" was
-     `sum += acc_rot[i] * inv_rot[j,d]` with `acc_rot[i]` outside the j-loop,
-     i.e., a scalar × a column sum, NOT a matrix-vector product. Fixed by
-     combining softmax-normalized per-simdgroup accumulators into
-     `tg_acc[0..HEAD_DIM)` via `sid==0` and doing a proper
-     `sum_j(tg_acc[j] * inv_rot[j,d])` in Phase 4.
-  4. Quantization scale mismatch — after orthonormal rotation each per-dim
-     component of `(Pi·k)/||k||` has std `~1/sqrt(HEAD_DIM)=1/16`, but the
-     encoder quantized with thresholds at `±1/0/-1` and the decoder
-     reconstructed `centroid*||k||` — off by `sqrt(HEAD_DIM)`. Fixed by
-     multiplying by `sqrt(HEAD_DIM)` at encode and `1/sqrt(HEAD_DIM)` at decode.
-- **Still broken:** With all 4 fixes applied, comparing baseline vs TQ_KV=1 at
-  32 tokens shows divergence at gen token 17 — before `gpu_attn_fuse` activates
-  (kv_len still < 32). That means the TQ buffer allocations or kernel writes
-  are corrupting the CPU float KV cache somehow. Likely a memory-bounds issue
-  in the TQ output buffers or a Metal shared-buffer aliasing bug. Not yet
-  root-caused.
-- **Current default:** init prints a warning, forces `use_tq_kv=0`, uses the
-  standard float KV cache and GPU attention path. Set `TQ_KV_FORCE=1` to opt
-  into the still-broken path for debugging.
 
 ### Temporal prediction (`--predict`) — functional net regression
 - 26% hit rate, -58% generation speed vs baseline. Matches historical

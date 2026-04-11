@@ -109,7 +109,157 @@ working on hardware (no silent mismatches at the observed hit rate).
 
 ---
 
-## TurboQuant (TQ_KV=1) — currently force-fallback, not fixed
+## TurboQuant (TQ_KV=1) — FIXED 2026-04-11
+
+**Status:** TurboQuant now produces fully coherent output end-to-end at all
+tested context lengths. Force-fallback gate replaced by `TQ_KV_SAFE=1` opt-in
+for A/B testing.
+
+### The bug that mattered most
+
+`tq_pack_update` writes the per-position L2 norms via the `k_norms_out` /
+`v_norms_out` kernel parameters at buffer indices 4 / 6. The C dispatch was
+binding the wrong buffers there:
+
+```objc
+[tq_enc setBuffer:g_metal->buf_tq_encode_k_norms offset:0 atIndex:4];  // wrong
+[tq_enc setBuffer:g_metal->buf_tq_encode_v_norms offset:0 atIndex:6];  // wrong
+```
+
+`buf_tq_encode_*_norms` are tiny per-step scratch buffers used by an earlier,
+abandoned design that precomputed norms on the CPU. The persistent
+per-position cache (`buf_tq_k_norms[fa_idx]` / `buf_tq_v_norms[fa_idx]`),
+which `tq_fused_attention` reads at runtime, was **never written to**. It
+stayed all zeros forever. Every TQ-decoded K/V value was therefore
+`centroid * 0 = 0`, the attention contribution from the full-attention layers
+vanished, and the model produced bad output once `gpu_attn_fuse` engaged.
+
+The fix is one line per buffer:
+
+```objc
+[tq_enc setBuffer:g_metal->buf_tq_k_norms[fa_idx] offset:0 atIndex:4];
+[tq_enc setBuffer:g_metal->buf_tq_v_norms[fa_idx] offset:0 atIndex:6];
+```
+
+### How we found it
+
+Per-layer hidden-state hashes (gated on `TQ_KV_DBG=1`) for `baseline` vs
+`TQ_KV_FORCE=1` showed first divergence at **gen=16, layer 3** — exactly
+when `kv_len=32` made `gpu_attn_fuse` activate. The CPU KV cache hashes
+matched bit-for-bit at that step, ruling out memory corruption. So the bug
+had to be in the GPU attention path itself.
+
+A diagnostic Phase-4 write that encoded `global_max`, `global_sum`, `inv_sum`,
+`tg_max[0]`, `tg_sum[0]`, `tg_acc[0]`, `q_rot[0]`, `T_kv` into successive
+`attn_out` slots revealed:
+
+```
+attn_out = 0.0  (global_max)
+           32.0 (global_sum = T_kv exactly — uniform softmax!)
+           0.0312 (inv_sum = 1/32)
+           0.0  (tg_max[0])
+           4.0  (tg_sum[0] = T_kv/num_sg, exp(0)=1 for every key)
+           0.0  (tg_acc[0])
+           ...  (q_rot[0])
+           32.0 (T_kv)
+```
+
+`global_max=0` and `tg_max=0` mean every QK score was 0 → softmax was
+uniform → attention output collapsed to a constant. That implied `k_val =
+centroid * k_norm * tq_inv_scale = centroid * 0 * 1/16 = 0`. A second peek at
+`k_norms[0..3]` and `v_norms[0..3]` confirmed the persistent cache was all
+zeros, leading directly to the buffer-binding bug above.
+
+### The full fix list (all needed for TQ to actually work)
+
+1. **`tq_pack_update` buffer binding** — bind persistent norms cache, not
+   the per-step scratch (the critical bug).
+2. **Gram-Schmidt rotation matrix** — rewrite as standard row Gram-Schmidt
+   so `Pi` is actually orthonormal.
+3. **`tq_fused_attention` Phase 3** — broadcast `global_max` /
+   `global_sum` via threadgroup memory; previously they were computed only
+   on `lid==0` but used per-thread (other threads saw `-1e10` / `0`).
+4. **`tq_fused_attention` Phase 4** — replace
+   `sum += acc_rot[i] * inv_rot[j*N+d]` with a real
+   `sum_j(tg_acc[j] * inv_rot[d*N+j])` matmul. The original was a scalar
+   times a column sum.
+5. **Quantization scale mismatch** — multiply by `sqrt(HEAD_DIM)` at
+   encode and divide by `sqrt(HEAD_DIM)` at decode in all 4 TQ kernels so
+   the centroids `{-1.5,-0.5,0.5,1.5}` match the per-dim distribution of
+   `(Pi·k)/||k||`.
+6. **`tq_pack_update` `kv_head=1` norm write** — was guarded by
+   `if (tgid == 0)` which only fired for `kv_head=0`; changed to
+   `if (lane == 0 && word_idx == 0)` so both heads write their norms.
+7. **Double sigmoid gate** — `tq_fused_attention` Phase 5 was applying
+   the sigmoid gate, then `cmd_fused`'s `sigmoid_gate` kernel applied it
+   again. Removed Phase 5 (Enc A4 always runs).
+8. **Pre-rotate Q on CPU** — to make `dot(Q, K) = dot(Pi@Q, Pi@K)` collapse
+   correctly under orthonormal `Pi`, the kernel needs Q in the rotated
+   basis. Added a one-time per-layer per-head matvec on CPU before the
+   `memcpy` into `buf_attn_q` (gated on `g_metal->use_tq_kv`).
+
+### Validated benchmarks
+
+```
+Baseline      128tok, K=4: 5.91 tok/s, 104 coherent tokens (EOS at 104)
+TQ_KV=1       128tok, K=4: 5.31 tok/s, 128 coherent tokens, KV cache 33.4 MB
+TQ_KV=1       256tok, K=4: 5.15 tok/s, 256 coherent tokens, KV cache 33.4 MB
+```
+
+### Per-layer timing comparison (TQ vs baseline at 128 tok)
+
+```
+                baseline    TQ_KV=1
+expert_io       1.346 ms    1.390 ms
+cmd1_wait       0.890 ms    0.913 ms
+cpu_attn        0.008 ms    0.205 ms   ← CPU Q rotation overhead
+cmd2_encode     0.018 ms    0.089 ms
+cmd2_wait       0.434 ms    0.419 ms
+tq_kernel_time  0.000 ms    0.070 ms   ← per-token tq_pack_update
+total_layer     2.750 ms    3.069 ms
+```
+
+TQ adds ~0.32 ms/layer (12% slowdown at 128 tokens) but compresses the KV
+cache by **7.5x**:
+
+```
+                Float KV     TQ KV
+per layer/tok   2,048 B      272 B   (16 u32 x 2 heads + 2 norms)
+8k tokens, 15 layers   252 MB   33.4 MB
+32k tokens, 15 layers  1.0 GB   134 MB
+128k tokens, 15 layers 4.0 GB   536 MB
+```
+
+The CPU Q rotation is the easy next optimization (the inner matvec is a
+simple HEAD_DIM × HEAD_DIM dense matmul that vectorizes trivially). At long
+context (>1k tokens) the smaller KV cache also shrinks `cmd1_wait` since the
+attention dispatch reads less memory.
+
+### Quality
+
+For the same prompt the first 32 generated tokens are bit-for-bit identical
+to baseline. Around token 32-33 the small 2-bit quantization noise (per-step
+~2% L2 error in the attention output) causes argmax to flip to a different
+token, and the two stories diverge into different (equally coherent) endings:
+
+- **Baseline:** "...minute hand that moved at a constant speed, but it was
+  the second hand that was truly special. It moved in a peculiar way,
+  completing a full circle in exactly 60 seconds, but it did so in a series
+  of jerky movements, pausing for a brief moment at the 12 o'clock
+  position before continuing its journey around the clock face."
+- **TQ:** "...minute hand that was 12 cm long and an hour hand that was 9
+  cm long. The old clockmaker had a peculiar habit of checking the time on
+  his clock at specific intervals, and he noticed something interesting
+  about the angle between the hour and minute hands... 'Can anyone tell me
+  the exact time when the angle between the hour and minute hands of this
+  clock is exactly 90 degrees?'"
+
+Both are grammatical, on-topic, and coherent for the full 256-token run.
+This is the expected behavior of a 2-bit lossy KV cache compression.
+
+---
+
+## (historical) TurboQuant force-fallback (now removed)
 
 TQ generation path has at least four bugs:
 

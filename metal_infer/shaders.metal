@@ -1584,27 +1584,26 @@ kernel void tq_fused_attention(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- Phase 4: Inverse rotation out[d] = sum_j( acc[j] * inv_rot[j, d] )
+    // ---- Phase 4: Inverse rotation out = Pi^T @ acc  (TQv2 — fixed indexing)
+    // Stored:    V_rot = Pi @ V, so acc = sum_i w_i V_rot_i = Pi @ output.
+    // Therefore: output = Pi^T @ acc, i.e. output[d] = sum_j Pi^T[d,j] * acc[j]
+    //                                              = sum_j Pi[j,d]   * acc[j]
+    // inv_rot is stored as Pi^T row-major, so inv_rot[d*HEAD_DIM+j] = Pi^T[d,j].
     // Each thread owns LANES_PER_SIMD output dimensions.
     float out[LANES_PER_SIMD];
     for (int i = 0; i < LANES_PER_SIMD; i++) {
         uint d = lane + i * SIMD_SIZE;
         if (d >= HEAD_DIM) { out[i] = 0.0f; continue; }
-        float sum = 0.0f;
+        float acc_sum = 0.0f;
+        uint row_base = d * HEAD_DIM;
         for (uint j = 0; j < HEAD_DIM; j++) {
-            sum += tg_acc[j] * inv_rot_matrix[j * HEAD_DIM + d];
+            acc_sum += tg_acc[j] * inv_rot_matrix[row_base + j];
         }
-        out[i] = sum;
+        out[i] = acc_sum;
     }
 
-    // ---- Phase 5: Apply sigmoid gate ----
-    for (int i = 0; i < LANES_PER_SIMD; i++) {
-        uint d = lane + i * SIMD_SIZE;
-        if (d >= HEAD_DIM) continue;
-        float g = q_gate[q_off + d];
-        float gate = 1.0f / (1.0f + metal::fast::exp(-g));
-        out[i] *= gate;
-    }
+    // ---- Phase 5: (gate is applied later by sigmoid_gate kernel in cmd_fused;
+    //              keeping it here would double-apply, so this phase is now a no-op)
 
     // ---- Write output ----
     for (int i = 0; i < LANES_PER_SIMD; i++) {
@@ -1663,8 +1662,11 @@ kernel void tq_pack_update(
     float k_norm = metal::fast::sqrt(simd_sum(k_local_sq) + RMS_EPS);
     float v_norm = metal::fast::sqrt(simd_sum(v_local_sq) + RMS_EPS);
 
-    // Lane 0 writes norms
-    if (tgid == 0) {
+    // Each kv_head writes its own norm. Use lane==0 && word_idx==0 so that
+    // exactly one threadgroup per kv_head (tgid=0 for kv_head=0, tgid=16
+    // for kv_head=1) performs the write — the prior `if (tgid == 0)` only
+    // wrote kv_head=0's norm and left kv_head=1 stuck at 0.
+    if (lane == 0 && word_idx == 0) {
         k_norms_out[pos * NUM_KV_HEADS + kv_head] = k_norm;
         v_norms_out[pos * NUM_KV_HEADS + kv_head] = v_norm;
     }
