@@ -1066,6 +1066,13 @@ typedef struct {
     id<MTLBuffer> buf_batched_T_q;       // [NUM_ATTN_HEADS * MAX_BATCH_T * HEAD_DIM] float
     id<MTLBuffer> buf_batched_T_scores;  // [NUM_ATTN_HEADS * MAX_BATCH_T * GPU_KV_SEQ] float
     id<MTLBuffer> buf_batched_T_out;     // [NUM_ATTN_HEADS * MAX_BATCH_T * HEAD_DIM] float
+    // Batched projection scratch buffers for fused_layer_forward_batch
+    id<MTLBuffer> buf_batch_normed;      // [MAX_BATCH_T, HIDDEN_DIM] float — normed inputs
+    id<MTLBuffer> buf_batch_qproj;       // [MAX_BATCH_T, NUM_ATTN_HEADS*HEAD_DIM*2] float
+    id<MTLBuffer> buf_batch_kproj;       // [MAX_BATCH_T, NUM_KV_HEADS*HEAD_DIM] float
+    id<MTLBuffer> buf_batch_vproj;       // [MAX_BATCH_T, NUM_KV_HEADS*HEAD_DIM] float
+    id<MTLBuffer> buf_batch_oproj_in;    // [MAX_BATCH_T, NUM_ATTN_HEADS*HEAD_DIM] float
+    id<MTLBuffer> buf_batch_oproj_out;   // [MAX_BATCH_T, HIDDEN_DIM] float
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -1382,6 +1389,20 @@ static MetalCtx *metal_setup(void) {
                                                             options:MTLResourceStorageModeShared];
         ctx->buf_batched_T_out    = [ctx->device newBufferWithLength:(size_t)NUM_ATTN_HEADS * MAX_BATCH_T * HEAD_DIM * sizeof(float)
                                                             options:MTLResourceStorageModeShared];
+
+        // Batched projection scratch buffers for fused_layer_forward_batch
+        ctx->buf_batch_normed    = [ctx->device newBufferWithLength:(size_t)MAX_BATCH_T * HIDDEN_DIM * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+        ctx->buf_batch_qproj     = [ctx->device newBufferWithLength:(size_t)MAX_BATCH_T * NUM_ATTN_HEADS * HEAD_DIM * 2 * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+        ctx->buf_batch_kproj     = [ctx->device newBufferWithLength:(size_t)MAX_BATCH_T * NUM_KV_HEADS * HEAD_DIM * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+        ctx->buf_batch_vproj     = [ctx->device newBufferWithLength:(size_t)MAX_BATCH_T * NUM_KV_HEADS * HEAD_DIM * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+        ctx->buf_batch_oproj_in  = [ctx->device newBufferWithLength:(size_t)MAX_BATCH_T * NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+        ctx->buf_batch_oproj_out = [ctx->device newBufferWithLength:(size_t)MAX_BATCH_T * HIDDEN_DIM * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
 
         printf("[metal] GPU attention buffers: scores buf %.1f MB\n",
                (double)(NUM_ATTN_HEADS * GPU_TQ_SEQ * sizeof(float)) / 1e6);
@@ -4412,7 +4433,10 @@ static void dispatch_experts_sparse(
             SparseExpertBucket *bkt = &map.buckets[b];
             int eid = bkt->expert_id;
 
-            // Load this expert ONCE into buf_multi_expert_data[0]
+            // Load this expert ONCE into buf_expert_data (via pread + copy).
+            // We pread into buf_multi_expert_data[0] first (mmap-friendly), then
+            // pass already_in_buffer=0 to gpu_expert_forward so it copies into
+            // buf_expert_data — the Metal buffer the kernel actually reads from.
             off_t offset = (off_t)eid * esz;
             void *dst = [g_metal->buf_multi_expert_data[0] contents];
             ssize_t nread = pread(packed_fd, dst, esz, offset);
@@ -4422,16 +4446,21 @@ static void dispatch_experts_sparse(
                 continue;
             }
 
-            // For each token that selected this expert, run the GPU forward
+            // For each token that selected this expert, run the GPU forward.
+            // First token: pass already_in_buffer=0 so gpu_expert_forward copies
+            // from dst (buf_multi_expert_data[0] contents) into buf_expert_data.
+            // Subsequent tokens: pass already_in_buffer=1 — the expert weights are
+            // already in buf_expert_data from the first call, so skip the memcpy.
             for (int s = 0; s < bkt->count; s++) {
                 int tok = bkt->token_indices[s];
                 float gw = bkt->gate_weights[s];
                 const float *in = h_post + (size_t)tok * HIDDEN_DIM;
 
-                // Use the existing single-token GPU path (buf_expert_data already set)
                 float tmp_out[HIDDEN_DIM];
                 memset(tmp_out, 0, sizeof(tmp_out));
-                gpu_expert_forward(g_metal, dst, in, tmp_out, /*already_in_buffer=*/1);
+                // s==0: copy from dst into buf_expert_data (already_in_buffer=0)
+                // s>0:  expert data already in buf_expert_data, skip copy (already_in_buffer=1)
+                gpu_expert_forward(g_metal, dst, in, tmp_out, /*already_in_buffer=*/(s > 0));
 
                 // Accumulate weighted output
                 float *out_tok = expert_out + (size_t)tok * HIDDEN_DIM;
@@ -6586,6 +6615,37 @@ static void fused_layer_forward(
 // pos_start is the position of hidden_batch[0]; subsequent tokens use
 // pos_start+1, +2, ... +T-1.
 // ============================================================================
+// ============================================================================
+// FNV-1a hash helper for BATCH_PREFILL_DBG diagnostics
+// ============================================================================
+static inline uint64_t batch_prefill_dbg_hash(const float *p, int n) {
+    uint64_t h = 14695981039346656037ULL;
+    const uint32_t *u = (const uint32_t *)p;
+    for (int i = 0; i < n; i++) { h ^= (uint64_t)u[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+// Env-var-gated debug printing for per-layer hash comparison.
+// Set BATCH_PREFILL_DBG=1 to enable.
+static int g_bpdbg_enabled = -1;  // -1 = not yet checked
+
+static void bpdbg_init(void) {
+    if (g_bpdbg_enabled < 0) {
+        const char *v = getenv("BATCH_PREFILL_DBG");
+        g_bpdbg_enabled = (v && v[0] == '1') ? 1 : 0;
+    }
+}
+
+static void bpdbg_print(int gen_tok, int layer, int tok_in_batch, const float *hidden) {
+    if (!g_bpdbg_enabled) return;
+    uint64_t h = batch_prefill_dbg_hash(hidden, HIDDEN_DIM);
+    fprintf(stderr, "BPDBG gen=%d layer=%02d t=%d hash=%016llx\n",
+            gen_tok, layer, tok_in_batch, (unsigned long long)h);
+}
+
+// Global generation token counter for debug tracing (incremented in main)
+static int g_gen_tok_counter = 0;
+
 static void fused_layer_forward_batch(
     WeightFile *wf,
     int layer_idx,
@@ -6598,25 +6658,481 @@ static void fused_layer_forward_batch(
     int K,
     int packed_fd
 ) {
-    // Stage 0 fallback: call the per-token path T times.  fused_layer_forward
-    // defers the expert MoE compute and writes back to g_deferred.hidden in
-    // the next call's fast path.  In the per-token prefill loop the next
-    // call's hidden pointer is the SAME chain (same token, next layer), so
-    // the fast path reuses buf_input correctly.  Here the next call is a
-    // DIFFERENT token at the SAME layer, so the fast path would corrupt
-    // buf_input.  Worse, simply discarding the deferred state would leave
-    // the previous token's hidden incomplete (no MoE combine applied).
-    // We need complete_deferred_experts() between per-token calls — wait,
-    // apply the combine, write back to the saved hidden pointer, clear state.
-    // This loses the cmd3<->cmd1 pipeline benefit but is the only correct
-    // composition of the existing per-token function in a batched outer loop.
-    for (int t = 0; t < T; t++) {
-        if (g_deferred.active) {
-            complete_deferred_experts();
+    bpdbg_init();
+
+    int is_full = (kv != NULL);
+    // Determine whether we can use the native batched path.
+    // Conditions for batched path:
+    //   1. Full-attention layer (kv != NULL, la_state == NULL)
+    //   2. TurboQuant KV-cache NOT enabled (TQ attention kernel is single-query only)
+    //   3. T > 1 (T==1 falls through to per-token path, which is already optimized)
+    //   4. Required Metal pipelines available
+    //   5. kv_len + T <= GPU_KV_SEQ (KV buffer not exceeded)
+    //   6. Layer weight cache is built and all required weight pointers are available
+    int use_batched = (is_full &&
+                       T > 1 &&
+                       g_metal &&
+                       g_metal->matmul_4bit &&
+                       g_metal->attn_scores_batched_T_pipe &&
+                       g_metal->attn_softmax_batched_T_pipe &&
+                       g_metal->attn_values_batched_T_pipe &&
+                       g_metal->buf_batch_normed &&
+                       g_metal->buf_batch_qproj &&
+                       !g_metal->use_tq_kv &&
+                       kv && (kv->len + T) <= GPU_KV_SEQ);
+
+    if (!use_batched) {
+        // ---- Sequential fallback: per-token loop ----
+        // Used for: linear-attention layers, TQ mode, T==1, missing pipelines,
+        // or KV buffer overflow. Correct but loses batching speedup.
+        for (int t = 0; t < T; t++) {
+            if (g_deferred.active) {
+                complete_deferred_experts();
+            }
+            fused_layer_forward(wf, layer_idx, hidden_batch + (size_t)t * HIDDEN_DIM,
+                                kv, la_state, pos_start + t, mmap_base, K, packed_fd);
+            if (g_bpdbg_enabled) {
+                // Must complete deferred before hashing (hidden not yet updated)
+                if (g_deferred.active) complete_deferred_experts();
+                bpdbg_print(g_gen_tok_counter, layer_idx, t,
+                            hidden_batch + (size_t)t * HIDDEN_DIM);
+            }
         }
-        fused_layer_forward(wf, layer_idx, hidden_batch + (size_t)t * HIDDEN_DIM,
-                            kv, la_state, pos_start + t, mmap_base, K, packed_fd);
+        return;
     }
+
+    // ========================================================================
+    // NATIVE BATCHED PATH — full-attention, float KV, T > 1
+    // ========================================================================
+    //
+    // Strategy: use PER-TOKEN computation for Q/K/V projections (same kernel
+    // as fused_layer_forward — matvec_fast) and attention (CPU when kv_len < 32,
+    // GPU batched when kv_len >= 32). This produces numerically identical hidden
+    // states to the per-token path for the KV cache and attention outputs.
+    //
+    // The key speedup comes from dispatch_experts_sparse (Step 8), which loads
+    // each unique expert ONCE for all T tokens instead of T×K separate loads.
+    //
+    // The batched path does NOT use the deferred expert pipeline. It completes
+    // fully synchronously and leaves g_deferred.active == 0 on exit.
+    // ========================================================================
+
+    // Must flush any pending deferred state from previous layer
+    if (g_deferred.active) {
+        complete_deferred_experts();
+    }
+
+    init_layer_scratch();
+    if (!layer_cache_built) build_layer_cache(wf);
+    LayerWeightCache *lc = &layer_cache[layer_idx];
+
+    int q_proj_dim = NUM_ATTN_HEADS * HEAD_DIM * 2;
+    int kv_dim     = NUM_KV_HEADS * HEAD_DIM;
+    int q_dim      = NUM_ATTN_HEADS * HEAD_DIM;
+    int fa_idx     = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1;
+
+    // Validate weight pointers
+    if (!lc->q_w || !lc->q_s || !lc->q_b ||
+        !lc->k_w || !lc->k_s || !lc->k_b ||
+        !lc->v_w || !lc->v_s || !lc->v_b ||
+        !lc->o_w || !lc->o_s || !lc->o_b ||
+        !lc->input_norm_w || !lc->post_attn_norm_w ||
+        !lc->gate_w || !lc->gate_s || !lc->gate_b ||
+        fa_idx < 0 || fa_idx >= NUM_FULL_ATTN_LAYERS) {
+        // Missing weights — fall back to per-token
+        for (int t = 0; t < T; t++) {
+            if (g_deferred.active) complete_deferred_experts();
+            fused_layer_forward(wf, layer_idx, hidden_batch + (size_t)t * HIDDEN_DIM,
+                                kv, la_state, pos_start + t, mmap_base, K, packed_fd);
+            if (g_bpdbg_enabled) {
+                if (g_deferred.active) complete_deferred_experts();
+                bpdbg_print(g_gen_tok_counter, layer_idx, t,
+                            hidden_batch + (size_t)t * HIDDEN_DIM);
+            }
+        }
+        return;
+    }
+
+    // ---- Allocate per-token buffers ----
+    float *residual_batch = malloc((size_t)T * HIDDEN_DIM * sizeof(float));
+    float *q_batch        = malloc((size_t)T * q_dim * sizeof(float));
+    float *q_gate_batch   = malloc((size_t)T * q_dim * sizeof(float));
+    // attn_gated: [T, q_dim] — attention output after sigmoid gate, input to o_proj
+    float *attn_gated_batch = malloc((size_t)T * q_dim * sizeof(float));
+    // oproj_out_batch: [T, HIDDEN_DIM] — o_proj output per token
+    float *oproj_out_batch = malloc((size_t)T * HIDDEN_DIM * sizeof(float));
+
+    // Per-token normed input (stored in Metal shared buffer for GPU attention path)
+    float *normed_batch_ptr = (float *)[g_metal->buf_batch_normed contents];
+
+    // Determine KV length after this batch (needed for attention dispatch)
+    int kv_len_before = kv->len;
+    int kv_len_after  = kv_len_before + T;
+
+    // ---- STEP 1: Per-token input RMS norm + Q/K/V projections ----
+    // Use fast_batch_matvec (matvec_fast kernel) — same as fused_layer_forward.
+    // This ensures numerically identical Q/K/V values to the per-token path.
+    for (int t = 0; t < T; t++) {
+        float *hidden_t   = hidden_batch + (size_t)t * HIDDEN_DIM;
+        float *residual_t = residual_batch + (size_t)t * HIDDEN_DIM;
+        float *normed_t   = normed_batch_ptr + (size_t)t * HIDDEN_DIM;
+        float *q_t        = q_batch        + (size_t)t * q_dim;
+        float *q_gate_t   = q_gate_batch   + (size_t)t * q_dim;
+
+        // Save residual before norm
+        memcpy(residual_t, hidden_t, HIDDEN_DIM * sizeof(float));
+        cpu_rms_norm(hidden_t, lc->input_norm_w, normed_t, HIDDEN_DIM, RMS_NORM_EPS);
+
+        // Q/K/V projections via matvec_fast (same kernel as fused_layer_forward)
+        // Use static scratch as output; copy to our per-token arrays after.
+        BatchMatvecSpec qkv_specs[3] = {
+            { lc->q_w, lc->q_s, lc->q_b, s_q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0 },
+            { lc->k_w, lc->k_s, lc->k_b, s_k_proj_out, (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1 },
+            { lc->v_w, lc->v_s, lc->v_b, s_v_proj_out, (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2 },
+        };
+        fast_batch_matvec(normed_t, HIDDEN_DIM, qkv_specs, 3);
+
+        // Split q_proj → q and q_gate (interleaved [head, q, gate] layout)
+        for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+            const float *src = s_q_proj_out + h * (2 * HEAD_DIM);
+            memcpy(q_t      + h * HEAD_DIM, src,            HEAD_DIM * sizeof(float));
+            memcpy(q_gate_t + h * HEAD_DIM, src + HEAD_DIM, HEAD_DIM * sizeof(float));
+        }
+
+        // Q RMSNorm
+        if (lc->q_norm_w) {
+            for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+                float *qh = q_t + h * HEAD_DIM;
+                float sum_sq = 0.0f;
+                for (int i = 0; i < HEAD_DIM; i++) sum_sq += qh[i] * qh[i];
+                float inv_rms = 1.0f / sqrtf(sum_sq / HEAD_DIM + RMS_NORM_EPS);
+                for (int i = 0; i < HEAD_DIM; i++) qh[i] = qh[i] * inv_rms * bf16_to_f32(lc->q_norm_w[i]);
+            }
+        }
+
+        // K RMSNorm (in-place on s_k_proj_out)
+        if (lc->k_norm_w) {
+            for (int h = 0; h < NUM_KV_HEADS; h++) {
+                float *kh = s_k_proj_out + h * HEAD_DIM;
+                float sum_sq = 0.0f;
+                for (int i = 0; i < HEAD_DIM; i++) sum_sq += kh[i] * kh[i];
+                float inv_rms = 1.0f / sqrtf(sum_sq / HEAD_DIM + RMS_NORM_EPS);
+                for (int i = 0; i < HEAD_DIM; i++) kh[i] = kh[i] * inv_rms * bf16_to_f32(lc->k_norm_w[i]);
+            }
+        }
+
+        // RoPE (modifies q_t and s_k_proj_out in-place)
+        int pos = pos_start + t;
+        apply_rotary_emb(q_t, s_k_proj_out, pos, NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM, ROTARY_DIM);
+
+        // Write K and V to CPU KV cache
+        int cache_pos = kv_len_before + t;
+        memcpy(kv->k_cache + (size_t)cache_pos * kv_dim, s_k_proj_out, kv_dim * sizeof(float));
+        memcpy(kv->v_cache + (size_t)cache_pos * kv_dim, s_v_proj_out, kv_dim * sizeof(float));
+
+        // Write K and V to GPU KV buffer mirror
+        if (g_metal->buf_kv_k[fa_idx]) {
+            memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + (size_t)cache_pos * kv_dim,
+                   s_k_proj_out, kv_dim * sizeof(float));
+            memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + (size_t)cache_pos * kv_dim,
+                   s_v_proj_out, kv_dim * sizeof(float));
+        }
+    }
+
+    // Update KV cache length
+    kv->len = kv_len_after;
+
+    // ---- STEP 2: Attention ----
+    // For kv_len_after < 32: use CPU attention per token (same threshold as fused_layer_forward).
+    // For kv_len_after >= 32: use GPU batched attention (attn_*_batched_T kernels).
+    int use_gpu_attn = (g_metal && g_metal->attn_scores_batched_T_pipe &&
+                        g_metal->attn_softmax_batched_T_pipe &&
+                        g_metal->attn_values_batched_T_pipe &&
+                        g_metal->buf_kv_k[fa_idx] &&
+                        kv_len_after >= 32);
+
+    if (use_gpu_attn) {
+        // GPU batched attention: build Q buffer in [NH, T, HD] layout
+        float *btq = (float *)[g_metal->buf_batched_T_q contents];
+        for (int t = 0; t < T; t++) {
+            const float *q_t = q_batch + (size_t)t * q_dim;
+            for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+                float *dst = btq + (h * T + t) * HEAD_DIM;
+                memcpy(dst, q_t + h * HEAD_DIM, HEAD_DIM * sizeof(float));
+            }
+        }
+
+        uint32_t uT       = (uint32_t)T;
+        uint32_t uNH      = NUM_ATTN_HEADS;
+        uint32_t uHD      = HEAD_DIM;
+        uint32_t uKVD     = (uint32_t)kv_dim;
+        uint32_t uKVLen   = (uint32_t)kv_len_after;
+        uint32_t uSeqStr  = GPU_KV_SEQ;
+        uint32_t uHpKV    = (uint32_t)(NUM_ATTN_HEADS / NUM_KV_HEADS);
+        float    scale    = 1.0f / sqrtf((float)HEAD_DIM);
+
+        id<MTLCommandBuffer> cmd_attn = [g_metal->queue commandBuffer];
+
+        // Kernel 1: attn_scores_batched_T
+        {
+            uint32_t total_tgs = uNH * uT * uKVLen;
+            id<MTLComputeCommandEncoder> enc = [cmd_attn computeCommandEncoder];
+            [enc setComputePipelineState:g_metal->attn_scores_batched_T_pipe];
+            [enc setBuffer:g_metal->buf_batched_T_q      offset:0 atIndex:0];
+            [enc setBuffer:g_metal->buf_kv_k[fa_idx]     offset:0 atIndex:1];
+            [enc setBuffer:g_metal->buf_batched_T_scores  offset:0 atIndex:2];
+            [enc setBytes:&uHD      length:4 atIndex:3];
+            [enc setBytes:&uKVD     length:4 atIndex:4];
+            [enc setBytes:&uKVLen   length:4 atIndex:5];
+            [enc setBytes:&uSeqStr  length:4 atIndex:6];
+            [enc setBytes:&scale    length:4 atIndex:7];
+            [enc setBytes:&uHpKV    length:4 atIndex:8];
+            [enc setBytes:&uT       length:4 atIndex:9];
+            [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+
+        // Kernel 2: attn_softmax_batched_T
+        {
+            uint32_t total_tgs = uNH * uT;
+            id<MTLComputeCommandEncoder> enc = [cmd_attn computeCommandEncoder];
+            [enc setComputePipelineState:g_metal->attn_softmax_batched_T_pipe];
+            [enc setBuffer:g_metal->buf_batched_T_scores  offset:0 atIndex:0];
+            [enc setBytes:&uKVLen   length:4 atIndex:1];
+            [enc setBytes:&uSeqStr  length:4 atIndex:2];
+            [enc setBytes:&uT       length:4 atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+
+        // Kernel 3: attn_values_batched_T — output [NH, T, HD]
+        {
+            uint32_t total_threads = uNH * uT * uHD;
+            uint32_t tgs = (total_threads + 255) / 256;
+            id<MTLComputeCommandEncoder> enc = [cmd_attn computeCommandEncoder];
+            [enc setComputePipelineState:g_metal->attn_values_batched_T_pipe];
+            [enc setBuffer:g_metal->buf_batched_T_scores  offset:0 atIndex:0];
+            [enc setBuffer:g_metal->buf_kv_v[fa_idx]      offset:0 atIndex:1];
+            [enc setBuffer:g_metal->buf_batched_T_out     offset:0 atIndex:2];
+            [enc setBytes:&uHD      length:4 atIndex:3];
+            [enc setBytes:&uKVD     length:4 atIndex:4];
+            [enc setBytes:&uKVLen   length:4 atIndex:5];
+            [enc setBytes:&uSeqStr  length:4 atIndex:6];
+            [enc setBytes:&uHpKV    length:4 atIndex:7];
+            [enc setBytes:&uT       length:4 atIndex:8];
+            [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+
+        [cmd_attn commit];
+        [cmd_attn waitUntilCompleted];
+
+        // Sigmoid gate + collect attn_gated per token
+        const float *attn_out_batch = (const float *)[g_metal->buf_batched_T_out contents];
+        for (int t = 0; t < T; t++) {
+            float *gated_t      = attn_gated_batch + (size_t)t * q_dim;
+            const float *gate_t = q_gate_batch     + (size_t)t * q_dim;
+            for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+                const float *attn_ht = attn_out_batch + (h * T + t) * HEAD_DIM;
+                float *dst_ht = gated_t + h * HEAD_DIM;
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    float g = 1.0f / (1.0f + expf(-gate_t[h * HEAD_DIM + d]));
+                    dst_ht[d] = attn_ht[d] * g;
+                }
+            }
+        }
+    } else {
+        // CPU attention per token (matches fused_layer_forward when kv_len < 32)
+        int heads_per_kv = NUM_ATTN_HEADS / NUM_KV_HEADS;
+        float scale = 1.0f / sqrtf((float)HEAD_DIM);
+        for (int t = 0; t < T; t++) {
+            const float *q_t    = q_batch        + (size_t)t * q_dim;
+            const float *gate_t = q_gate_batch   + (size_t)t * q_dim;
+            float *gated_t      = attn_gated_batch + (size_t)t * q_dim;
+            int this_kv_len = kv_len_before + t + 1;  // keys available for this query
+
+            memset(gated_t, 0, q_dim * sizeof(float));
+            for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+                int kv_h = h / heads_per_kv;
+                const float *qh = q_t + h * HEAD_DIM;
+                float *scores = malloc(this_kv_len * sizeof(float));
+                for (int p = 0; p < this_kv_len; p++) {
+                    const float *kp = kv->k_cache + (size_t)p * kv_dim + kv_h * HEAD_DIM;
+                    float dot = 0.0f;
+                    for (int d = 0; d < HEAD_DIM; d++) dot += qh[d] * kp[d];
+                    scores[p] = dot * scale;
+                }
+                cpu_softmax(scores, this_kv_len);
+                float *oh = gated_t + h * HEAD_DIM;
+                for (int p = 0; p < this_kv_len; p++) {
+                    const float *vp = kv->v_cache + (size_t)p * kv_dim + kv_h * HEAD_DIM;
+                    for (int d = 0; d < HEAD_DIM; d++) oh[d] += scores[p] * vp[d];
+                }
+                free(scores);
+                // Apply sigmoid gate (same as per-token CPU path)
+                const float *gate_h = gate_t + h * HEAD_DIM;
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    float g = 1.0f / (1.0f + expf(-gate_h[d]));
+                    oh[d] *= g;
+                }
+            }
+        }
+    }
+
+    // ---- STEP 3: Per-token O projection via matvec_fast ----
+    // Input: attn_gated_batch [T, q_dim]; Output: oproj_out_batch [T, HIDDEN_DIM]
+    // Use static scratch (s_attn_out as input proxy); copy result out.
+    for (int t = 0; t < T; t++) {
+        const float *gated_t = attn_gated_batch + (size_t)t * q_dim;
+        float *oproj_t       = oproj_out_batch  + (size_t)t * HIDDEN_DIM;
+        BatchMatvecSpec o_spec[1] = {
+            { lc->o_w, lc->o_s, lc->o_b, oproj_t, HIDDEN_DIM, (uint32_t)q_dim, GROUP_SIZE, 6 },
+        };
+        fast_batch_matvec(gated_t, (uint32_t)q_dim, o_spec, 1);
+    }
+
+    const float *oproj_out = oproj_out_batch;
+
+    // ---- STEP 7: Per-token residual_add + post-attn-norm + routing ----
+    // Allocate per-token routing results
+    int   *all_expert_indices  = malloc((size_t)T * K * sizeof(int));
+    float *all_expert_weights  = malloc((size_t)T * K * sizeof(float));
+    float *h_post_batch        = malloc((size_t)T * HIDDEN_DIM * sizeof(float));
+    float *h_mid_batch         = malloc((size_t)T * HIDDEN_DIM * sizeof(float));
+    float *shared_gate_batch   = malloc((size_t)T * SHARED_INTERMEDIATE * sizeof(float));
+    float *shared_up_batch     = malloc((size_t)T * SHARED_INTERMEDIATE * sizeof(float));
+    float *shared_gate_scores  = malloc((size_t)T * sizeof(float));
+
+    uint32_t *gate_w  = lc->gate_w; uint16_t *gate_s = lc->gate_s, *gate_b = lc->gate_b;
+    uint32_t *sgw     = lc->sg_w;   uint16_t *sgs    = lc->sg_s,   *sgb    = lc->sg_b;
+    uint32_t *suw     = lc->su_w;   uint16_t *sus    = lc->su_s,   *sub    = lc->su_b;
+    uint32_t *seg_w   = lc->seg_w;  uint16_t *seg_s  = lc->seg_s,  *seg_b  = lc->seg_b;
+
+    int have_moe = (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
+                    suw && sus && sub && seg_w && seg_s && seg_b);
+
+    for (int t = 0; t < T; t++) {
+        float *hidden_t   = hidden_batch    + (size_t)t * HIDDEN_DIM;
+        float *residual_t = residual_batch  + (size_t)t * HIDDEN_DIM;
+        float *h_mid_t    = h_mid_batch     + (size_t)t * HIDDEN_DIM;
+        float *h_post_t   = h_post_batch    + (size_t)t * HIDDEN_DIM;
+        const float *oproj_t = oproj_out    + (size_t)t * HIDDEN_DIM;
+        float *sg_t       = shared_gate_batch + (size_t)t * SHARED_INTERMEDIATE;
+        float *su_t       = shared_up_batch   + (size_t)t * SHARED_INTERMEDIATE;
+
+        // residual_add: h_mid = residual + o_proj
+        for (int i = 0; i < HIDDEN_DIM; i++) {
+            h_mid_t[i] = residual_t[i] + oproj_t[i];
+        }
+        // Update hidden to h_mid (for the caller's state)
+        memcpy(hidden_t, h_mid_t, HIDDEN_DIM * sizeof(float));
+
+        // post_attn_norm → h_post
+        cpu_rms_norm(h_mid_t, lc->post_attn_norm_w, h_post_t, HIDDEN_DIM, RMS_NORM_EPS);
+
+        // Routing projections (CPU): gate_scores, shared_gate, shared_up, shared_gate_score
+        float gate_scores_t[NUM_EXPERTS];
+        memset(gate_scores_t, 0, NUM_EXPERTS * sizeof(float));
+        float sg_score_t = 0.0f;
+
+        if (have_moe) {
+            memset(sg_t, 0, SHARED_INTERMEDIATE * sizeof(float));
+            memset(su_t, 0, SHARED_INTERMEDIATE * sizeof(float));
+
+            // CPU batch matvec for routing + shared expert projections
+            BatchMatvecSpec moe_specs[4] = {
+                { gate_w, gate_s, gate_b, gate_scores_t,   (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0 },
+                { sgw,    sgs,    sgb,    sg_t,             (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1 },
+                { suw,    sus,    sub,    su_t,             (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2 },
+                { seg_w,  seg_s,  seg_b,  &sg_score_t,      1,                            HIDDEN_DIM, GROUP_SIZE, 3 },
+            };
+            fast_batch_matvec(h_post_t, HIDDEN_DIM, moe_specs, 4);
+        }
+
+        shared_gate_scores[t] = sg_score_t;
+
+        // Softmax + top-K routing
+        cpu_softmax(gate_scores_t, NUM_EXPERTS);
+        int   *eidx_t = all_expert_indices + t * K;
+        float *ewt_t  = all_expert_weights  + t * K;
+        cpu_topk(gate_scores_t, NUM_EXPERTS, K, eidx_t, ewt_t);
+        cpu_normalize_weights(ewt_t, K);
+
+        if (g_freq_tracking) {
+            for (int k = 0; k < K; k++) g_expert_freq[layer_idx][eidx_t[k]]++;
+            if (t == 0 && layer_idx == 0) g_freq_total_tokens += T;
+        }
+    }
+
+    // ---- STEP 8: Sparse MoE dispatch ----
+    // Process all T tokens' expert routing with shared expert loading
+    float *expert_out_batch = calloc((size_t)T * HIDDEN_DIM, sizeof(float));
+
+    if (packed_fd >= 0 && g_metal && g_metal->buf_multi_expert_data[0]) {
+        dispatch_experts_sparse(T, K,
+                                all_expert_indices, all_expert_weights,
+                                h_post_batch, expert_out_batch,
+                                NULL, 0,
+                                layer_idx, packed_fd);
+    }
+
+    // ---- STEP 9: Shared expert + per-token combine ----
+    // For each token, also run shared expert and combine outputs
+    uint32_t *sdw = lc->sd_w; uint16_t *sds = lc->sd_s, *sdb = lc->sd_b;
+    int have_shared_down = (sdw && sds && sdb);
+
+    for (int t = 0; t < T; t++) {
+        float *hidden_t = hidden_batch    + (size_t)t * HIDDEN_DIM;
+        float *h_mid_t  = h_mid_batch     + (size_t)t * HIDDEN_DIM;
+        float *sg_t     = shared_gate_batch + (size_t)t * SHARED_INTERMEDIATE;
+        float *su_t     = shared_up_batch   + (size_t)t * SHARED_INTERMEDIATE;
+        float *moe_t    = expert_out_batch  + (size_t)t * HIDDEN_DIM;
+
+        // Shared expert: SwiGLU + down_proj
+        float shared_out[HIDDEN_DIM];
+        memset(shared_out, 0, sizeof(shared_out));
+
+        float *shared_act = calloc(SHARED_INTERMEDIATE, sizeof(float));
+        cpu_swiglu(sg_t, su_t, shared_act, SHARED_INTERMEDIATE);
+        if (have_shared_down) {
+            fast_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
+                                HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+        }
+        free(shared_act);
+
+        // Shared expert gate weight
+        float shared_weight = cpu_sigmoid(shared_gate_scores[t]);
+        for (int i = 0; i < HIDDEN_DIM; i++) shared_out[i] *= shared_weight;
+
+        // Final combine: hidden = h_mid + moe_out + shared_out
+        for (int i = 0; i < HIDDEN_DIM; i++) {
+            hidden_t[i] = h_mid_t[i] + moe_t[i] + shared_out[i];
+        }
+
+        // Debug hash
+        if (g_bpdbg_enabled) {
+            bpdbg_print(g_gen_tok_counter, layer_idx, t, hidden_t);
+        }
+    }
+
+    // ---- Cleanup ----
+    free(residual_batch);
+    free(q_batch);
+    free(q_gate_batch);
+    free(attn_gated_batch);
+    free(oproj_out_batch);
+    free(all_expert_indices);
+    free(all_expert_weights);
+    free(h_post_batch);
+    free(h_mid_batch);
+    free(shared_gate_batch);
+    free(shared_up_batch);
+    free(shared_gate_scores);
+    free(expert_out_batch);
+    // g_deferred.active remains 0 — no deferred state left by this function
 }
 
 // ============================================================================
@@ -8573,6 +9089,7 @@ int main(int argc, char **argv) {
                     }
                     discard_deferred_experts();
                     pos += T_now;
+                    g_gen_tok_counter += T_now;
 
                     double t_chunk_end = now_ms();
                     if (processed == 0) first_tok_ms = (t_chunk_end - t_chunk) / T_now;
@@ -8604,6 +9121,7 @@ int main(int argc, char **argv) {
                     // by the next token's embedding. Only wait for GPU (buffer safety).
                     discard_deferred_experts();
                     pos++;
+                    g_gen_tok_counter++;
 
                     if (token_idx == 0) {
                         first_tok_ms = now_ms() - t_tok;
@@ -8630,6 +9148,7 @@ int main(int argc, char **argv) {
                 embed_lookup(wf, pt->ids[0], hidden);
             }
 
+            bpdbg_init();
             for (int layer = 0; layer < NUM_LAYERS; layer++) {
                 int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
                 fused_layer_forward(wf, layer, hidden,
@@ -8638,6 +9157,13 @@ int main(int argc, char **argv) {
                                     pos,
                                     layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                     K, layer_fds[layer]);
+                // BPDBG: per-layer hash for last prefill token
+                if (g_bpdbg_enabled) {
+                    if (g_deferred.active) complete_deferred_experts();
+                    fprintf(stderr, "BPDBG_LAST layer=%02d hash=%016llx\n",
+                            layer,
+                            (unsigned long long)batch_prefill_dbg_hash(hidden, HIDDEN_DIM));
+                }
             }
             // Full completion — need hidden state for final norm + lm_head
             complete_deferred_experts();
