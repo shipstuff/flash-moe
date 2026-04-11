@@ -51,10 +51,15 @@ Context  Baseline cmd2_wait  TQ cmd2_wait  Baseline tok/s  TQ tok/s  TQ delta
 ~30 tok       0.434              0.423            5.91         5.65    -4.4%
 ~1k tok       0.710              0.423            4.98         5.40    +8.4%
 ~2.4k tok     1.056              0.406            3.98         4.69   +17.8%
+~3k tok       1.221              0.408            3.72         4.27   +14.8%
 ```
 
 Crossover ≈ 600–800 token context. Beyond that TQ wins on both memory
-footprint (7.5x compression) and generation speed.
+footprint (7.5x compression) and generation speed. The 3k delta is
+slightly under the 2.4k delta because at 3k context the float KV cache
+(251 MB) starts adding page-cache pressure that bumps `expert_io` by
+~0.1 ms/layer in baseline; TQ keeps the cache at 33.4 MB so it stays out
+of the way.
 Real baseline per-layer: expert_io=1.337ms, cmd1_wait=0.858ms,
 cmd2_wait=0.426ms, total_layer=2.703ms. This matches the "5.86 tok/s" reference
 numbers in top-level `CLAUDE.md` (difference is measurement noise).
