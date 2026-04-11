@@ -122,6 +122,7 @@
 // KV cache maximum context length
 #define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
 #define GPU_KV_SEQ  8192     // GPU KV buffer pre-allocation (grows if exceeded, falls back to CPU attn)
+#define MAX_BATCH_T 32       // max T for batched-T prefill attention test harness
 
 // Special tokens
 #define EOS_TOKEN_1         248046
@@ -1057,6 +1058,14 @@ typedef struct {
     id<MTLBuffer> buf_conv_input;     // [12288] float
     id<MTLBuffer> buf_conv_output;    // [12288] float
     id<MTLComputePipelineState> matmul_4bit;  // dequant_matmul_4bit: batched T-input matmul
+    // Batched-T float-KV attention pipelines (batch prefill)
+    id<MTLComputePipelineState> attn_scores_batched_T_pipe;
+    id<MTLComputePipelineState> attn_softmax_batched_T_pipe;
+    id<MTLComputePipelineState> attn_values_batched_T_pipe;
+    // Scratch buffers for batched-T attention (allocated on first use; max T=32)
+    id<MTLBuffer> buf_batched_T_q;       // [NUM_ATTN_HEADS * MAX_BATCH_T * HEAD_DIM] float
+    id<MTLBuffer> buf_batched_T_scores;  // [NUM_ATTN_HEADS * MAX_BATCH_T * GPU_KV_SEQ] float
+    id<MTLBuffer> buf_batched_T_out;     // [NUM_ATTN_HEADS * MAX_BATCH_T * HEAD_DIM] float
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -1133,6 +1142,9 @@ static MetalCtx *metal_setup(void) {
     } else {
         printf("[metal] TurboQuant pipelines ready\n");
     }
+    ctx->attn_scores_batched_T_pipe  = makePipe(@"attn_scores_batched_T");
+    ctx->attn_softmax_batched_T_pipe = makePipe(@"attn_softmax_batched_T");
+    ctx->attn_values_batched_T_pipe  = makePipe(@"attn_values_batched_T");
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
     ctx->conv1d_step       = makePipe(@"conv1d_step");
@@ -1363,6 +1375,13 @@ static MetalCtx *metal_setup(void) {
                                                         options:MTLResourceStorageModeShared];
         ctx->buf_attn_gate   = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
+        // Batched-T prefill attention scratch buffers (pre-allocated for max T=MAX_BATCH_T)
+        ctx->buf_batched_T_q      = [ctx->device newBufferWithLength:(size_t)NUM_ATTN_HEADS * MAX_BATCH_T * HEAD_DIM * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+        ctx->buf_batched_T_scores = [ctx->device newBufferWithLength:(size_t)NUM_ATTN_HEADS * MAX_BATCH_T * GPU_KV_SEQ * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+        ctx->buf_batched_T_out    = [ctx->device newBufferWithLength:(size_t)NUM_ATTN_HEADS * MAX_BATCH_T * HEAD_DIM * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
 
         printf("[metal] GPU attention buffers: scores buf %.1f MB\n",
                (double)(NUM_ATTN_HEADS * GPU_TQ_SEQ * sizeof(float)) / 1e6);
@@ -7047,7 +7066,297 @@ static void print_usage(const char *prog) {
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --test-batch-matmul T,out_dim,in_dim  Run dequant_matmul_4bit correctness test and exit\n");
+    printf("  --test-batch-attn T,kv_len  Run batched-T attention validation (e.g. 4,256)\n");
     printf("  --help               This message\n");
+}
+
+// ============================================================================
+// Batched-T float-KV attention validation harness
+//
+// Tests attn_scores_batched_T / attn_softmax_batched_T / attn_values_batched_T
+// against a scalar CPU reference.  Sweeps the supplied (T, kv_len) pair.
+//
+// Usage:  ./infer --test-batch-attn 4,256
+// ============================================================================
+static float lcg_rand(uint32_t *state) {
+    // Simple LCG for reproducible random floats in [-1, 1]
+    *state = *state * 1664525u + 1013904223u;
+    return (float)(int32_t)(*state) / (float)INT32_MAX;
+}
+
+// cpu_softmax_causal: compute softmax over scores[0..valid_len-1], masking
+// positions > causal_pos with -inf.  Returns normalized weights in out[].
+static void cpu_softmax_causal(const float *scores, float *out,
+                                uint32_t kv_len, uint32_t causal_pos) {
+    float mx = -1e30f;
+    for (uint32_t p = 0; p < kv_len; p++) {
+        float v = (p <= causal_pos) ? scores[p] : -1e30f;
+        if (v > mx) mx = v;
+    }
+    float sum = 0.0f;
+    for (uint32_t p = 0; p < kv_len; p++) {
+        float v = (p <= causal_pos) ? expf(scores[p] - mx) : 0.0f;
+        out[p] = v;
+        sum += v;
+    }
+    float inv = 1.0f / sum;
+    for (uint32_t p = 0; p < kv_len; p++) out[p] *= inv;
+}
+
+// Returns 0 on pass, 1 on failure.
+static int run_batched_attn_test(MetalCtx *ctx, uint32_t T, uint32_t kv_len) {
+    if (T == 0 || T > (uint32_t)MAX_BATCH_T) {
+        fprintf(stderr, "[test] T=%u out of range [1, %d]\n", T, MAX_BATCH_T);
+        return 1;
+    }
+    if (kv_len == 0 || kv_len > (uint32_t)GPU_KV_SEQ) {
+        fprintf(stderr, "[test] kv_len=%u out of range [1, %d]\n", kv_len, GPU_KV_SEQ);
+        return 1;
+    }
+    if (!ctx->attn_scores_batched_T_pipe ||
+        !ctx->attn_softmax_batched_T_pipe ||
+        !ctx->attn_values_batched_T_pipe) {
+        fprintf(stderr, "[test] Batched-T pipelines not available — kernel compilation failed?\n");
+        return 1;
+    }
+
+    printf("[test-batch-attn] T=%u kv_len=%u  (NUM_ATTN_HEADS=%d NUM_KV_HEADS=%d HEAD_DIM=%d)\n",
+           T, kv_len, NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM);
+
+    const uint32_t nh    = NUM_ATTN_HEADS;
+    const uint32_t nkvh  = NUM_KV_HEADS;
+    const uint32_t hd    = HEAD_DIM;
+    const uint32_t kv_dim  = nkvh * hd;          // 512
+    const uint32_t seq_stride = GPU_KV_SEQ;
+    const uint32_t hpkv  = nh / nkvh;            // heads_per_kv = 16
+    const float    scale = 1.0f / sqrtf((float)hd);
+
+    // ---- Allocate CPU arrays ----
+    size_t Q_size       = (size_t)nh * T * hd;
+    size_t KV_size      = (size_t)GPU_KV_SEQ * kv_dim;   // full cache allocation
+    size_t out_size     = (size_t)nh * T * hd;
+    size_t scores_size  = (size_t)nh * T * seq_stride;
+
+    float *Q_cpu        = (float *)malloc(Q_size      * sizeof(float));
+    float *K_cpu        = (float *)malloc(KV_size     * sizeof(float));
+    float *V_cpu        = (float *)malloc(KV_size     * sizeof(float));
+    float *ref_out      = (float *)malloc(out_size    * sizeof(float));
+    float *gpu_out      = (float *)malloc(out_size    * sizeof(float));
+    float *scores_tmp   = (float *)malloc(scores_size * sizeof(float));
+
+    // Fill with seeded random data (only first kv_len positions of KV cache)
+    uint32_t rng = 12345;
+    for (size_t i = 0; i < Q_size; i++)  Q_cpu[i] = lcg_rand(&rng) * 0.1f;
+    // Fill all GPU_KV_SEQ positions so the buffer is valid but only kv_len matter
+    for (size_t i = 0; i < KV_size; i++) K_cpu[i] = lcg_rand(&rng) * 0.1f;
+    for (size_t i = 0; i < KV_size; i++) V_cpu[i] = lcg_rand(&rng) * 0.1f;
+    memset(scores_tmp, 0, scores_size * sizeof(float));
+
+    // ---- CPU reference ----
+    // For each head h, for each query t:
+    //   causal_pos = kv_len - T + t
+    //   score[p] = dot(Q[h,t,:], K[p, kv_h, :]) * scale   for p in [0, kv_len)
+    //   mask:  score[p] = -inf for p > causal_pos
+    //   weights = softmax(score)
+    //   out[h,t,d] = sum_p weights[p] * V[p, kv_h, d]
+    float *score_row = (float *)malloc(kv_len * sizeof(float));
+    float *weight_row = (float *)malloc(kv_len * sizeof(float));
+
+    for (uint32_t h = 0; h < nh; h++) {
+        uint32_t kv_h = h / hpkv;
+        for (uint32_t t = 0; t < T; t++) {
+            uint32_t causal_pos = kv_len - T + t;
+            const float *qht = Q_cpu + (h * T + t) * hd;
+
+            // Dot products
+            for (uint32_t p = 0; p < kv_len; p++) {
+                const float *kp = K_cpu + p * kv_dim + kv_h * hd;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < hd; d++) dot += qht[d] * kp[d];
+                score_row[p] = dot * scale;
+            }
+
+            // Softmax with causal mask
+            cpu_softmax_causal(score_row, weight_row, kv_len, causal_pos);
+
+            // Weighted sum over V
+            float *out_ht = ref_out + (h * T + t) * hd;
+            for (uint32_t d = 0; d < hd; d++) {
+                float acc = 0.0f;
+                for (uint32_t p = 0; p < kv_len; p++) {
+                    acc += weight_row[p] * V_cpu[p * kv_dim + kv_h * hd + d];
+                }
+                out_ht[d] = acc;
+            }
+        }
+    }
+    free(score_row);
+    free(weight_row);
+
+    // ---- GPU run ----
+    // Copy Q, K, V into Metal buffers
+    memcpy([ctx->buf_batched_T_q contents], Q_cpu, Q_size * sizeof(float));
+    // Allocate dedicated KV buffers for this test (buf_kv_k/v are per-layer; not used here)
+    id<MTLBuffer> test_kv_k = [ctx->device newBufferWithLength:KV_size * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+    id<MTLBuffer> test_kv_v = [ctx->device newBufferWithLength:KV_size * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+    memcpy([test_kv_k contents], K_cpu, KV_size * sizeof(float));
+    memcpy([test_kv_v contents], V_cpu, KV_size * sizeof(float));
+
+    // Zero scores and output buffers
+    memset([ctx->buf_batched_T_scores contents], 0,
+           (size_t)nh * T * seq_stride * sizeof(float));
+    memset([ctx->buf_batched_T_out contents], 0,
+           (size_t)nh * T * hd * sizeof(float));
+
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+
+    // --- Kernel 1: attn_scores_batched_T ---
+    {
+        uint32_t total_tgs = nh * T * kv_len;
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->attn_scores_batched_T_pipe];
+        [enc setBuffer:ctx->buf_batched_T_q      offset:0 atIndex:0];
+        [enc setBuffer:test_kv_k                  offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_batched_T_scores  offset:0 atIndex:2];
+        [enc setBytes:&hd          length:4 atIndex:3];
+        [enc setBytes:&kv_dim      length:4 atIndex:4];
+        [enc setBytes:&kv_len      length:4 atIndex:5];
+        [enc setBytes:&seq_stride  length:4 atIndex:6];
+        [enc setBytes:&scale       length:4 atIndex:7];
+        [enc setBytes:&hpkv        length:4 atIndex:8];
+        [enc setBytes:&T           length:4 atIndex:9];
+        [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    // --- Kernel 2: attn_softmax_batched_T ---
+    {
+        uint32_t total_tgs = nh * T;
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->attn_softmax_batched_T_pipe];
+        [enc setBuffer:ctx->buf_batched_T_scores  offset:0 atIndex:0];
+        [enc setBytes:&kv_len      length:4 atIndex:1];
+        [enc setBytes:&seq_stride  length:4 atIndex:2];
+        [enc setBytes:&T           length:4 atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    // --- Kernel 3: attn_values_batched_T ---
+    {
+        uint32_t total_threads = nh * T * hd;
+        uint32_t tgs = (total_threads + 255) / 256;
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->attn_values_batched_T_pipe];
+        [enc setBuffer:ctx->buf_batched_T_scores  offset:0 atIndex:0];
+        [enc setBuffer:test_kv_v                  offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_batched_T_out     offset:0 atIndex:2];
+        [enc setBytes:&hd          length:4 atIndex:3];
+        [enc setBytes:&kv_dim      length:4 atIndex:4];
+        [enc setBytes:&kv_len      length:4 atIndex:5];
+        [enc setBytes:&seq_stride  length:4 atIndex:6];
+        [enc setBytes:&hpkv        length:4 atIndex:7];
+        [enc setBytes:&T           length:4 atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    // Copy GPU output to CPU
+    memcpy(gpu_out, [ctx->buf_batched_T_out contents], out_size * sizeof(float));
+
+    // ---- Compare CPU vs GPU ----
+    float max_rel_err = 0.0f;
+    float max_abs_err = 0.0f;
+    int num_failures = 0;
+    const float REL_TOL = 1e-4f;
+
+    for (size_t i = 0; i < out_size; i++) {
+        float ref = ref_out[i];
+        float gpu = gpu_out[i];
+        float abs_err = fabsf(gpu - ref);
+        float rel_err = (fabsf(ref) > 1e-8f) ? abs_err / fabsf(ref) : abs_err;
+        if (abs_err > max_abs_err) max_abs_err = abs_err;
+        if (rel_err > max_rel_err) max_rel_err = rel_err;
+        if (rel_err > REL_TOL && abs_err > 1e-5f) {
+            if (num_failures < 5) {
+                // Decode index for diagnostic
+                uint32_t h = (uint32_t)(i / (T * hd));
+                uint32_t rem = (uint32_t)(i % (T * hd));
+                uint32_t t = rem / hd;
+                uint32_t d = rem % hd;
+                fprintf(stderr, "  [mismatch] h=%u t=%u d=%u: ref=%.6f gpu=%.6f rel=%.2e\n",
+                        h, t, d, ref, gpu, (double)rel_err);
+            }
+            num_failures++;
+        }
+    }
+
+    int passed = (num_failures == 0);
+    printf("  max_abs_err=%.3e  max_rel_err=%.3e  mismatches=%d/%zu  => %s\n",
+           (double)max_abs_err, (double)max_rel_err,
+           num_failures, out_size,
+           passed ? "PASS" : "FAIL");
+
+    // Cleanup
+    free(Q_cpu); free(K_cpu); free(V_cpu);
+    free(ref_out); free(gpu_out); free(scores_tmp);
+
+    return passed ? 0 : 1;
+}
+
+// Run a sweep of (T, kv_len) pairs as specified by the comma-separated arg.
+// Format: "T,kv_len" — tests just that single pair.
+// Call multiple times for a full sweep.
+static int test_batched_attention(const char *arg) {
+    // Parse T,kv_len from arg string
+    int T = 0, kv_len = 0;
+    if (sscanf(arg, "%d,%d", &T, &kv_len) != 2 || T <= 0 || kv_len <= 0) {
+        fprintf(stderr, "ERROR: --test-batch-attn expects 'T,kv_len' (e.g. 4,256)\n");
+        return 1;
+    }
+
+    if (!g_metal) {
+        fprintf(stderr, "ERROR: Metal not available — cannot run GPU test\n");
+        return 1;
+    }
+
+    // Always include the specified pair, plus a small sweep
+    static const int T_sweep[] = {1, 2, 4, 8};
+    static const int KV_sweep[] = {32, 256, 2048};
+    int n_T = 4, n_kv = 3;
+
+    // Check if the user-specified pair is already in the sweep
+    int found_T = 0, found_kv = 0;
+    for (int i = 0; i < n_T; i++) if (T_sweep[i] == T) { found_T = 1; break; }
+    for (int i = 0; i < n_kv; i++) if (KV_sweep[i] == kv_len) { found_kv = 1; break; }
+
+    int total_pass = 0, total_fail = 0;
+
+    // Run sweep
+    for (int ti = 0; ti < n_T; ti++) {
+        for (int ki = 0; ki < n_kv; ki++) {
+            int ret = run_batched_attn_test(g_metal, (uint32_t)T_sweep[ti], (uint32_t)KV_sweep[ki]);
+            if (ret == 0) total_pass++; else total_fail++;
+        }
+    }
+
+    // Run user-specified pair if not already covered
+    if (!found_T || !found_kv) {
+        int ret = run_batched_attn_test(g_metal, (uint32_t)T, (uint32_t)kv_len);
+        if (ret == 0) total_pass++; else total_fail++;
+    }
+
+    printf("\n[test-batch-attn] Summary: %d/%d passed\n",
+           total_pass, total_pass + total_fail);
+    return (total_fail == 0) ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
@@ -7064,36 +7373,38 @@ int main(int argc, char **argv) {
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
         const char *test_batch_matmul_arg = NULL;  // --test-batch-matmul T,out_dim,in_dim
+        const char *batch_attn_arg = NULL;  // --test-batch-attn T,kv_len
 
         static struct option long_options[] = {
-            {"model",         required_argument, 0, 'm'},
-            {"weights",       required_argument, 0, 'w'},
-            {"manifest",      required_argument, 0, 'j'},
-            {"vocab",         required_argument, 0, 'v'},
-            {"prompt-tokens", required_argument, 0, 'p'},
-            {"prompt",        required_argument, 0, 'P'},
-            {"tokens",        required_argument, 0, 't'},
-            {"k",             required_argument, 0, 'k'},
-            {"cache-entries",  required_argument, 0, 'C'},
-            {"malloc-cache",   required_argument, 0, 'M'},
-            {"cpu-linear",    no_argument,       0, 'L'},
-            {"skip-linear",   no_argument,       0, 'S'},
-            {"timing",        no_argument,       0, 'T'},
-            {"freq",          no_argument,       0, 'F'},
-            {"cache-telemetry", no_argument,     0, 'E'},
-            {"2bit",          no_argument,       0, '2'},
-            {"gpu-linear",    no_argument,       0, 'G'},
-            {"think-budget",  required_argument, 0, 'B'},
-            {"serve",         required_argument, 0, 'R'},
-            {"predict",       no_argument,       0, 'D'},
-            {"collect-routing", required_argument, 0, 'Z'},
+            {"model",             required_argument, 0, 'm'},
+            {"weights",           required_argument, 0, 'w'},
+            {"manifest",          required_argument, 0, 'j'},
+            {"vocab",             required_argument, 0, 'v'},
+            {"prompt-tokens",     required_argument, 0, 'p'},
+            {"prompt",            required_argument, 0, 'P'},
+            {"tokens",            required_argument, 0, 't'},
+            {"k",                 required_argument, 0, 'k'},
+            {"cache-entries",     required_argument, 0, 'C'},
+            {"malloc-cache",      required_argument, 0, 'M'},
+            {"cpu-linear",        no_argument,       0, 'L'},
+            {"skip-linear",       no_argument,       0, 'S'},
+            {"timing",            no_argument,       0, 'T'},
+            {"freq",              no_argument,       0, 'F'},
+            {"cache-telemetry",   no_argument,       0, 'E'},
+            {"2bit",              no_argument,       0, '2'},
+            {"gpu-linear",        no_argument,       0, 'G'},
+            {"think-budget",      required_argument, 0, 'B'},
+            {"serve",             required_argument, 0, 'R'},
+            {"predict",           no_argument,       0, 'D'},
+            {"collect-routing",   required_argument, 0, 'Z'},
             {"test-batch-matmul", required_argument, 0, 'X'},
-            {"help",          no_argument,       0, 'h'},
+            {"test-batch-attn",   required_argument, 0, 'A'},
+            {"help",              no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2GHh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:A:X:LSTFE2GDHh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -7114,6 +7425,7 @@ int main(int argc, char **argv) {
                 case '2': g_use_2bit = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
+                case 'A': batch_attn_arg = optarg; break;
                 case 'Z':
                     g_routing_log = fopen(optarg, "wb");
                     if (!g_routing_log) {
@@ -7194,6 +7506,11 @@ int main(int argc, char **argv) {
             }
             printf("[test_batch_matmul] Overall: %s\n", fail ? "FAIL" : "PASS");
             return fail;
+        }
+        // ---- --test-batch-attn T,kv_len: run GPU attention validation then exit ----
+        if (batch_attn_arg) {
+            int ret = test_batched_attention(batch_attn_arg);
+            return ret;
         }
 
         // ---- Initialize persistent I/O thread pool ----

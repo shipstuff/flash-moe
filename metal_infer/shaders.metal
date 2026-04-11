@@ -1869,3 +1869,194 @@ kernel void dequant_matmul_4bit(
         }
     }
 }
+
+
+
+// ============================================================================
+// Batched-T float-KV attention: three-kernel split for prefill of T queries.
+//
+// Buffer / layout conventions (all kernels share these):
+//   Q       : [NUM_ATTN_HEADS, T, HEAD_DIM]   head-major
+//   K_cache : [GPU_KV_SEQ, NUM_KV_HEADS, HEAD_DIM]   (existing buf_kv_k layout)
+//   V_cache : [GPU_KV_SEQ, NUM_KV_HEADS, HEAD_DIM]   (existing buf_kv_v layout)
+//   scores  : [NUM_ATTN_HEADS, T, seq_stride]         (seq_stride = GPU_KV_SEQ)
+//   out     : [NUM_ATTN_HEADS, T, HEAD_DIM]
+//
+// Causal mask convention:
+//   The T new tokens' K/V are already appended to the cache, so kv_len already
+//   includes the T new positions.  Query t corresponds to KV cache position
+//   (kv_len - T + t).  Keys at positions > (kv_len - T + t) are masked to -inf.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// Kernel: attn_scores_batched_T
+//   Computes scores[h, t, pos] = dot(Q[h,t,:], K[pos, kv_h,:]) * scale,
+//   with -inf for pos > causal_pos(t).
+//
+//   Grid  : (kv_len * T * num_heads, 1, 1)  — one TG per (pos, t, h)
+//   TG    : 256 threads, reducing over head_dim=256
+// ----------------------------------------------------------------------------
+kernel void attn_scores_batched_T(
+    device const float* Q          [[buffer(0)]],  // [num_heads, T, head_dim]
+    device const float* K_cache    [[buffer(1)]],  // [max_seq, kv_dim]
+    device float*       scores     [[buffer(2)]],  // [num_heads, T, seq_stride]
+    constant uint&      head_dim   [[buffer(3)]],  // 256
+    constant uint&      kv_dim     [[buffer(4)]],  // NUM_KV_HEADS * head_dim
+    constant uint&      kv_len     [[buffer(5)]],  // total keys in cache (includes T new)
+    constant uint&      seq_stride [[buffer(6)]],  // GPU_KV_SEQ
+    constant float&     scale      [[buffer(7)]],  // 1/sqrt(head_dim)
+    constant uint&      heads_per_kv [[buffer(8)]], // 16
+    constant uint&      T          [[buffer(9)]],  // batch size (number of queries)
+    uint tgid  [[threadgroup_position_in_grid]],   // linearized: pos + t*kv_len + h*(T*kv_len)
+    uint lid   [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    // Decompose tgid → (h, t, pos)
+    uint pos_t_stride = T * kv_len;
+    uint h   = tgid / pos_t_stride;
+    uint rem = tgid % pos_t_stride;
+    uint t   = rem / kv_len;
+    uint pos = rem % kv_len;
+
+    if (pos >= kv_len) return;
+
+    // Causal: query t may only attend to positions 0..(kv_len - T + t)
+    uint causal_pos = kv_len - T + t;
+    uint kv_h = h / heads_per_kv;
+
+    device const float* qh = Q + (h * T + t) * head_dim;
+    device const float* kp = K_cache + pos * kv_dim + kv_h * head_dim;
+
+    float acc = 0.0f;
+    if (pos <= causal_pos) {
+        for (uint d = lid; d < head_dim; d += tg_size) {
+            acc += qh[d] * kp[d];
+        }
+    }
+
+    // SIMD reduction
+    float simd_val = simd_sum(acc);
+    threadgroup float shared[32];
+    uint simd_lane  = lid % 32;
+    uint simd_group = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+    if (simd_lane == 0) shared[simd_group] = simd_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        float val = simd_sum(shared[simd_lane]);
+        if (simd_lane == 0) {
+            // scores layout: [h, t, pos] = h*(T*seq_stride) + t*seq_stride + pos
+            uint score_idx = h * (T * seq_stride) + t * seq_stride + pos;
+            scores[score_idx] = (pos <= causal_pos) ? val * scale : -1e30f;
+        }
+    }
+}
+
+
+// ----------------------------------------------------------------------------
+// Kernel: attn_softmax_batched_T
+//   In-place softmax over the kv_len dimension for each (h, t) row.
+//   Only the first kv_len entries in each row are valid (rest are ignored).
+//
+//   Grid  : (num_heads * T, 1, 1) — one TG per (h, t)
+//   TG    : 256 threads
+// ----------------------------------------------------------------------------
+kernel void attn_softmax_batched_T(
+    device float*    scores     [[buffer(0)]],  // [num_heads, T, seq_stride] in/out
+    constant uint&   kv_len     [[buffer(1)]],  // number of valid scores per row
+    constant uint&   seq_stride [[buffer(2)]],  // GPU_KV_SEQ
+    constant uint&   T          [[buffer(3)]],  // batch size
+    uint tgid    [[threadgroup_position_in_grid]],  // linearized: t + h*T
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    uint h = tgid / T;
+    uint t = tgid % T;
+    device float* s = scores + h * (T * seq_stride) + t * seq_stride;
+
+    // Pass 1: find max
+    threadgroup float shared_max[32];
+    float local_max = -1e30f;
+    for (uint i = lid; i < kv_len; i += tg_size) {
+        local_max = max(local_max, s[i]);
+    }
+    float sm = simd_max(local_max);
+    uint simd_lane  = lid % 32;
+    uint simd_group = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+    if (simd_lane == 0) shared_max[simd_group] = sm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_max = -1e30f;
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        global_max = simd_max(shared_max[simd_lane]);
+    }
+    threadgroup float broadcast_max = 0.0f;
+    if (lid == 0) broadcast_max = global_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    global_max = broadcast_max;
+
+    // Pass 2: exp and sum
+    threadgroup float shared_sum[32];
+    float local_sum = 0.0f;
+    for (uint i = lid; i < kv_len; i += tg_size) {
+        float val = exp(s[i] - global_max);
+        s[i] = val;
+        local_sum += val;
+    }
+    float simd_s = simd_sum(local_sum);
+    if (simd_lane == 0) shared_sum[simd_group] = simd_s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_sum = 0.0f;
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        global_sum = simd_sum(shared_sum[simd_lane]);
+    }
+    threadgroup float broadcast_sum = 0.0f;
+    if (lid == 0) broadcast_sum = global_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    global_sum = broadcast_sum;
+
+    // Pass 3: normalize
+    float inv_sum = 1.0f / global_sum;
+    for (uint i = lid; i < kv_len; i += tg_size) {
+        s[i] *= inv_sum;
+    }
+}
+
+
+// ----------------------------------------------------------------------------
+// Kernel: attn_values_batched_T
+//   Output[h, t, d] = sum_p( scores[h, t, p] * V[p, kv_h, d] )
+//
+//   Grid  : (HEAD_DIM * T * num_heads, 1, 1) — one thread per (h, t, d)
+//   TG    : 256 threads (flat linear dispatch)
+// ----------------------------------------------------------------------------
+kernel void attn_values_batched_T(
+    device const float* scores   [[buffer(0)]],  // [num_heads, T, seq_stride]
+    device const float* V_cache  [[buffer(1)]],  // [max_seq, kv_dim]
+    device float*       out      [[buffer(2)]],  // [num_heads, T, head_dim]
+    constant uint&      head_dim  [[buffer(3)]],
+    constant uint&      kv_dim    [[buffer(4)]],
+    constant uint&      kv_len    [[buffer(5)]],
+    constant uint&      seq_stride [[buffer(6)]],
+    constant uint&      heads_per_kv [[buffer(7)]],
+    constant uint&      T         [[buffer(8)]],
+    uint tid [[thread_position_in_grid]]  // linearized: d + t*head_dim + h*(T*head_dim)
+) {
+    uint Thead = T * head_dim;
+    uint h = tid / Thead;
+    uint rem = tid % Thead;
+    uint t = rem / head_dim;
+    uint d = rem % head_dim;
+
+    uint kv_h = h / heads_per_kv;
+    device const float* s = scores + h * (T * seq_stride) + t * seq_stride;
+
+    float acc = 0.0f;
+    for (uint p = 0; p < kv_len; p++) {
+        acc += s[p] * V_cache[p * kv_dim + kv_h * head_dim + d];
+    }
+    out[h * Thead + t * head_dim + d] = acc;
+}
