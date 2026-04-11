@@ -87,6 +87,28 @@ not-actually-doing-I/O path with garbage expert data. See the benchmark file
 
 ---
 
+## Research Scoping Docs (not implemented)
+
+Parked investigations that have been scoped in detail but are waiting for a
+focused multi-session effort. Read these before re-opening a related topic.
+
+- `docs/2026-04-11-batch-prefill-scoping.md` — the batch prefill refactor
+  investigation. Current native batched path is cold-cache only; warm-cache
+  is regressed because the layer-outside, tokens-inside loop structure
+  breaks the intra-token CMD3↔CMD1 pipelining. Two refactor approaches
+  (multi-buffered deferred state, MoE cross-token decoupling) were
+  investigated by parallel sub-agents — both bounded by the ~97% GPU
+  saturation ceiling. The afternoon update is the load-bearing section.
+- `docs/2026-04-11-ane-offload-scoping.md` — Apple Neural Engine offload for
+  the 45 GatedDeltaNet linear-attention layers. The parallel `anemll-qwen35`
+  project on `carl@192.168.0.62` has a working Qwen3.5-9B dense ANE port at
+  ~11.4 tok/s; its PyTorch reference and LUT4 converter pipeline cover both
+  layer types flash_moe uses. Gated on measuring Swift CoreML per-prediction
+  dispatch overhead in Phase 0 before committing the port. Estimated
+  9-15 focused days for Phase 0 through Phase 4.
+
+---
+
 ## What's Broken
 
 ### Temporal prediction (`--predict`) — functional net regression
