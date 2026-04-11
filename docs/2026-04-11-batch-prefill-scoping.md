@@ -141,3 +141,82 @@ order:
    (1k, 2k, 3k contexts). Compare wall-time prefill against
    `--batch-prefill 1`.
 
+---
+
+## 2026-04-11 afternoon update — native batched path (status: cold-cache only)
+
+The first real integration (`c08cf07` + `ddf25d1`, sub-agent branch
+`integration-batch-prefill`) replaced the stub with a native
+full-attention batched path. It found and fixed a real bug:
+`dispatch_experts_sparse` was calling `gpu_expert_forward(..., already_in_buffer=1)`
+after preading into `buf_multi_expert_data[0]`, but `gpu_expert_forward`
+always reads from `buf_expert_data`. The fix passes
+`already_in_buffer=(s > 0)` so the first token of each unique expert
+does the copy and subsequent tokens reuse.
+
+**Correctness:** T=1/4/8 bit-identical token sequences at both 18-token
+(clockmaker) and 138-token (forest/cartographer) prompts. Natural EOS
+generation. ✅
+
+**Wall-time sweep (warm page cache, M4 Pro):**
+| Prompt | T=1 rest avg | T=4 rest avg | T=8 rest avg | T=4 total vs T=1 |
+|---|---|---|---|---|
+| 18 tok  | 125 ms | 152 ms | 164 ms | ~flat |
+| 50 tok  | 150 ms | 144 ms | 143 ms | ~flat |
+| 138 tok | 150 ms | **236 ms** | **190 ms** | **+57% slower** |
+
+**Cold-cache first-chunk only:**
+| Prompt | T=1 first | T=4 first | Speedup |
+|---|---|---|---|
+| 15 tok  | 622 ms | 265 ms | 2.35x |
+| 138 tok | 684 ms | 859 ms | 0.80x (slower) |
+
+### Why the per-layer batching loses at long prompts
+
+Traced the architecture carefully. The per-token prefill loop is fast
+because of **intra-token layer pipelining**: each layer's
+`fused_layer_forward` fast path *finalizes the previous layer's GPU MoE
+dispatch while starting the next layer's CMD1*. The CMD3↔CMD1 overlap
+eliminates the GPU wait between layers. This is structurally
+**layers-inside-tokens**.
+
+The native batched path inverts the loop to **layers-outside-tokens**
+(runs T tokens through layer L, then T tokens through layer L+1). That
+inversion breaks the pipeline. Worse, 45/60 layers are linear-attention
+and fall back to the sequential path where each call to
+`fused_layer_forward` inside the inner T-token loop must call
+`complete_deferred_experts()` to ensure `hidden_batch[t-1]` has been
+finalized before `hidden_batch[t]` can be used as input to the same
+layer. That's (T-1)×45×60 GPU stalls per prefill chunk — the regression
+source.
+
+Net: the only benefit that survives is sparse MoE expert I/O
+amortization on the *first* chunk when the page cache is cold. Past the
+first chunk the stall cost dominates.
+
+### Status: cold-cache-only opt-in
+
+`--batch-prefill T` is correct but currently a **net loss for warm-cache
+real prompts**. Gated as opt-in (default T=1). Useful only for:
+- Very short (<20 tok) prompts on genuinely cold page cache
+- Scenarios where prefill is a one-shot first-chunk cost
+
+### Next steps — needs a deeper refactor
+
+To get a real speedup, one of:
+
+**Approach A (Multi-buffered deferred state):** keep the loop in
+layers-inside-tokens form but run T token streams in lockstep — T
+separate `buf_input_batch[t]` + T separate deferred states, all
+pipelined. Preserves the existing CMD3↔CMD1 overlap and naturally
+batches expert loading because T tokens want the same layer's experts
+at the same time.
+
+**Approach B (MoE cross-token decoupling):** keep layers-inside-tokens
+per-token but queue the MoE routing decisions across adjacent tokens at
+the same layer, then dispatch via sparse-MoE once T routing decisions
+have accumulated. Smaller surgical change than A. Requires carefully
+decoupling MoE completion from the deferred-expert pipeline.
+
+Both are scoped as multi-session refactors with hash-diff validation at
+every stage. Sub-agents spawned to explore each in parallel.
