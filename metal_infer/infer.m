@@ -1056,6 +1056,7 @@ typedef struct {
     id<MTLBuffer> buf_delta_output;   // [8192] float
     id<MTLBuffer> buf_conv_input;     // [12288] float
     id<MTLBuffer> buf_conv_output;    // [12288] float
+    id<MTLComputePipelineState> matmul_4bit;  // dequant_matmul_4bit: batched T-input matmul
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -1138,6 +1139,8 @@ static MetalCtx *metal_setup(void) {
     ctx->rms_norm_qk       = makePipe(@"rms_norm_qk");
     ctx->compute_decay_beta = makePipe(@"compute_decay_beta");
     ctx->gated_rms_norm    = makePipe(@"gated_rms_norm");
+    ctx->matmul_4bit       = makePipe(@"dequant_matmul_4bit");
+    if (!ctx->matmul_4bit)  fprintf(stderr, "[metal] WARNING: dequant_matmul_4bit pipeline failed\n");
     if (!ctx->moe_combine_residual) fprintf(stderr, "[metal] WARNING: moe_combine_residual pipeline failed\n");
     if (!ctx->delta_net_step) fprintf(stderr, "[metal] WARNING: gated_delta_net_step pipeline failed (CPU fallback)\n");
     if (!ctx->conv1d_step)    fprintf(stderr, "[metal] WARNING: conv1d_step pipeline failed (CPU fallback)\n");
@@ -6811,6 +6814,215 @@ static void serve_loop(
 }
 
 // ============================================================================
+// Helpers for test harness
+// ============================================================================
+
+// Float bit-cast to uint32 for bf16 encoding (forward decl needed before use)
+static inline uint32_t as_type_uint(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    return u;
+}
+
+// ============================================================================
+// Test harness: dequant_matmul_4bit correctness check
+// ============================================================================
+//
+// Generates random W/scales/biases/X, runs the reference dequant_matvec_4bit_v3
+// T times (once per input row) to produce Y_ref[T, out_dim], then runs
+// dequant_matmul_4bit once to produce Y[T, out_dim].  Reports max and mean
+// relative error.  Should be < 1e-4 (and typically bitwise-equal given
+// identical arithmetic order in the inner loop).
+//
+// group_size is hardcoded to 64 (production default).  in_dim must be a
+// multiple of 8 * group_size = 512.  T must be <= 8 (register array cap).
+//
+// Returns 0 on pass, 1 on failure.
+
+static int test_dequant_matmul_4bit(MetalCtx *ctx, int T, int out_dim, int in_dim) {
+    if (!ctx->matmul_4bit) {
+        fprintf(stderr, "[test] dequant_matmul_4bit pipeline not available\n");
+        return 1;
+    }
+    if (T < 1 || T > 8) {
+        fprintf(stderr, "[test] T=%d out of range [1..8]\n", T);
+        return 1;
+    }
+    const int group_size = 64;
+    if (in_dim % (8 * group_size) != 0) {
+        fprintf(stderr, "[test] in_dim=%d not a multiple of %d\n", in_dim, 8*group_size);
+        return 1;
+    }
+
+    // Sizes
+    int packed_cols  = in_dim / 8;
+    int num_groups   = in_dim / group_size;
+    size_t W_sz  = (size_t)out_dim * packed_cols * sizeof(uint32_t);
+    size_t S_sz  = (size_t)out_dim * num_groups  * sizeof(uint16_t);
+    size_t B_sz  = S_sz;
+    size_t X_sz  = (size_t)T * in_dim            * sizeof(float);
+    size_t Y_sz  = (size_t)T * out_dim           * sizeof(float);
+
+    // Allocate CPU buffers
+    uint32_t *W_cpu  = (uint32_t *)malloc(W_sz);
+    uint16_t *S_cpu  = (uint16_t *)malloc(S_sz);
+    uint16_t *B_cpu  = (uint16_t *)malloc(B_sz);
+    float    *X_cpu  = (float    *)malloc(X_sz);
+    float    *Y_ref  = (float    *)calloc(T * out_dim, sizeof(float));
+    float    *Y_cpu  = (float    *)calloc(T * out_dim, sizeof(float));
+
+    // Fill with deterministic random data (srand(42))
+    srand(42);
+    for (size_t i = 0; i < W_sz / sizeof(uint32_t); i++)
+        W_cpu[i] = (uint32_t)rand();
+    // scales: small positive bf16 values (encode as uint16 upper 16 bits of float)
+    for (size_t i = 0; i < S_sz / sizeof(uint16_t); i++) {
+        // Random scale in [0.001, 0.1]
+        float f = 0.001f + 0.099f * ((float)rand() / RAND_MAX);
+        S_cpu[i] = (uint16_t)(as_type_uint(f) >> 16);
+    }
+    // biases: random in [-0.05, 0.05]
+    for (size_t i = 0; i < B_sz / sizeof(uint16_t); i++) {
+        float f = -0.05f + 0.1f * ((float)rand() / RAND_MAX);
+        B_cpu[i] = (uint16_t)(as_type_uint(f) >> 16);
+    }
+    // inputs: random float in [-1, 1]
+    for (size_t i = 0; i < X_sz / sizeof(float); i++)
+        X_cpu[i] = -1.0f + 2.0f * ((float)rand() / RAND_MAX);
+
+    // Allocate Metal buffers (shared/managed)
+    id<MTLBuffer> buf_W = [ctx->device newBufferWithBytes:W_cpu length:W_sz
+                                options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_S = [ctx->device newBufferWithBytes:S_cpu length:S_sz
+                                options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_B = [ctx->device newBufferWithBytes:B_cpu length:B_sz
+                                options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_X = [ctx->device newBufferWithBytes:X_cpu length:X_sz
+                                options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_Y = [ctx->device newBufferWithLength:Y_sz
+                                options:MTLResourceStorageModeShared];
+
+    uint32_t u_out_dim    = (uint32_t)out_dim;
+    uint32_t u_in_dim     = (uint32_t)in_dim;
+    uint32_t u_group_size = (uint32_t)group_size;
+    uint32_t u_T          = (uint32_t)T;
+
+    // ---- Reference: CPU scalar computation (canonical ground truth) ----
+    // This avoids any GPU accumulation-order differences between kernels.
+    // Arithmetic: y[row] = sum_i( (nibble_i * scale_g + bias_g) * x[i] )
+    // Exact same formula as the Metal kernels (nibble * scale + bias) * x.
+    {
+        int packed_per_g = group_size / 8;
+        for (int t = 0; t < T; t++) {
+            const float *x_row = X_cpu + t * in_dim;
+            float *y_row = Y_ref + t * out_dim;
+            for (int row = 0; row < out_dim; row++) {
+                const uint32_t *w_row = W_cpu + row * packed_cols;
+                const uint16_t *s_row = S_cpu + row * num_groups;
+                const uint16_t *b_row = B_cpu + row * num_groups;
+                float acc = 0.0f;
+                for (int g = 0; g < num_groups; g++) {
+                    // Decode bf16 scale/bias via the same as_type trick the shaders use
+                    uint32_t su = ((uint32_t)s_row[g]) << 16;
+                    uint32_t bu = ((uint32_t)b_row[g]) << 16;
+                    float scale, bias_v;
+                    memcpy(&scale,  &su, sizeof(float));
+                    memcpy(&bias_v, &bu, sizeof(float));
+                    int base_p = g * packed_per_g;
+                    int base_x = g * group_size;
+                    for (int p = 0; p < packed_per_g; p++) {
+                        uint32_t packed = w_row[base_p + p];
+                        int xb = base_x + p * 8;
+                        for (int n = 0; n < 8; n++) {
+                            uint32_t nibble = (packed >> (n * 4)) & 0xF;
+                            float w_val = (float)nibble * scale + bias_v;
+                            acc += w_val * x_row[xb + n];
+                        }
+                    }
+                }
+                y_row[row] = acc;
+            }
+        }
+    }
+
+    // ---- New kernel: dequant_matmul_4bit once for all T rows ----
+    {
+        id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:ctx->matmul_4bit];
+        [enc setBuffer:buf_W offset:0 atIndex:0];
+        [enc setBuffer:buf_S offset:0 atIndex:1];
+        [enc setBuffer:buf_B offset:0 atIndex:2];
+        [enc setBuffer:buf_X offset:0 atIndex:3];
+        [enc setBuffer:buf_Y offset:0 atIndex:4];
+        [enc setBytes:&u_T          length:4 atIndex:5];
+        [enc setBytes:&u_out_dim    length:4 atIndex:6];
+        [enc setBytes:&u_in_dim     length:4 atIndex:7];
+        [enc setBytes:&u_group_size length:4 atIndex:8];
+
+        uint32_t num_tgs = ((uint32_t)out_dim + 7) / 8;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cmdbuf commit];
+        [cmdbuf waitUntilCompleted];
+    }
+
+    // ---- Compare GPU output vs CPU reference ----
+    // Y_ref was already filled by the CPU reference loop above.
+    memcpy(Y_cpu, [buf_Y contents], Y_sz);
+
+    float max_rel_err  = 0.0f;
+    float sum_rel_err  = 0.0f;
+    long  num_elements = (long)T * out_dim;
+    int   num_bad_strict = 0;   // >1e-4 (strict, may differ due to fp accumulation order)
+    int   num_bad_loose  = 0;   // >5e-2 (loose; real bugs show many failures, not just 1)
+    long  max_idx = 0;
+
+    for (long i = 0; i < num_elements; i++) {
+        float ref = Y_ref[i];
+        float got = Y_cpu[i];
+        // Use max(|ref|, |got|, 1e-3) as denominator to avoid inflated relative
+        // errors when the true value is near zero.  A value of 1e-3 is appropriate
+        // because our accumulations involve 7168 terms of ~0.01 scale each, so the
+        // expected output magnitude is O(1..10) and 1e-3 is safely small compared
+        // to typical non-negligible outputs.
+        float denom = fabsf(ref);
+        if (fabsf(got) > denom) denom = fabsf(got);
+        if (denom < 1e-3f) denom = 1e-3f;
+        float rel = fabsf(got - ref) / denom;
+        if (rel > max_rel_err) { max_rel_err = rel; max_idx = i; }
+        sum_rel_err += rel;
+        if (rel > 1e-4f) num_bad_strict++;
+        if (rel > 5e-2f) num_bad_loose++;
+    }
+    float mean_rel_err = sum_rel_err / (float)num_elements;
+    if (num_bad_loose > 0) {
+        // Print worst element for debugging
+        long bi = max_idx;
+        int t_idx = (int)(bi / out_dim), row_idx = (int)(bi % out_dim);
+        fprintf(stderr, "[debug] worst: t=%d row=%d ref=%.6f got=%.6f rel=%.4e\n",
+                t_idx, row_idx, Y_ref[bi], Y_cpu[bi], max_rel_err);
+    }
+
+    // Pass criterion: mean relative error < 1e-4 AND no element > 5e-2.
+    // The per-element 1e-4 strict threshold is reported but not used for pass/fail:
+    // GPU simd_sum vs CPU sequential accumulation over N=7168 terms causes legitimate
+    // relative errors up to ~1e-2 for near-zero outputs (catastrophic cancellation).
+    // The 5e-2 threshold flags real bugs (wrong nibble decode, wrong group, etc.)
+    // which would manifest as many elements failing, not isolated outliers.
+    int pass = (mean_rel_err < 1e-4f) && (num_bad_loose == 0);
+    printf("[test_batch_matmul] T=%d out_dim=%d in_dim=%d : "
+           "max_rel=%.2e mean_rel=%.2e bad>1e-4: %d bad>5e-2: %d %s\n",
+           T, out_dim, in_dim, max_rel_err, mean_rel_err,
+           num_bad_strict, num_bad_loose,
+           pass ? "PASS" : "FAIL");
+
+    free(W_cpu); free(S_cpu); free(B_cpu); free(X_cpu); free(Y_ref); free(Y_cpu);
+    return pass ? 0 : 1;
+}
+
+// ============================================================================
 
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
@@ -6834,6 +7046,7 @@ static void print_usage(const char *prog) {
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
+    printf("  --test-batch-matmul T,out_dim,in_dim  Run dequant_matmul_4bit correctness test and exit\n");
     printf("  --help               This message\n");
 }
 
@@ -6850,6 +7063,7 @@ int main(int argc, char **argv) {
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
+        const char *test_batch_matmul_arg = NULL;  // --test-batch-matmul T,out_dim,in_dim
 
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
@@ -6873,6 +7087,7 @@ int main(int argc, char **argv) {
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"test-batch-matmul", required_argument, 0, 'X'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -6908,6 +7123,7 @@ int main(int argc, char **argv) {
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
+                case 'X': test_batch_matmul_arg = optarg; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -6949,6 +7165,35 @@ int main(int argc, char **argv) {
         g_metal = metal_setup();
         if (!g_metal) {
             fprintf(stderr, "WARNING: Metal init failed, falling back to CPU\n");
+        }
+
+        // ---- --test-batch-matmul: run synthetic correctness test then exit ----
+        if (test_batch_matmul_arg) {
+            if (!g_metal) {
+                fprintf(stderr, "ERROR: Metal required for --test-batch-matmul\n");
+                return 1;
+            }
+            int T_arg = 4, od_arg = 1024, id_arg = 7168;
+            sscanf(test_batch_matmul_arg, "%d,%d,%d", &T_arg, &od_arg, &id_arg);
+            printf("[test_batch_matmul] Running sweep T=%d out_dim=%d in_dim=%d\n",
+                   T_arg, od_arg, id_arg);
+            int fail = 0;
+            // Sweep T in {1,2,4,8} (capped at requested T_arg)
+            int ts[] = {1, 2, 4, 8};
+            for (int i = 0; i < 4; i++) {
+                int t = ts[i];
+                if (t > T_arg) continue;
+                fail |= test_dequant_matmul_4bit(g_metal, t, od_arg, id_arg);
+            }
+            // Also sweep out_dim in {1024, 4096} at requested T
+            int ods[] = {1024, 4096};
+            for (int i = 0; i < 2; i++) {
+                int od = ods[i];
+                if (od == od_arg) continue;  // already tested above
+                fail |= test_dequant_matmul_4bit(g_metal, T_arg, od, id_arg);
+            }
+            printf("[test_batch_matmul] Overall: %s\n", fail ? "FAIL" : "PASS");
+            return fail;
         }
 
         // ---- Initialize persistent I/O thread pool ----

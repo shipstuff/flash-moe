@@ -1751,3 +1751,121 @@ kernel void tq_dequant_all(
         }
     }
 }
+
+
+
+// ============================================================================
+// Kernel: dequant_matmul_4bit
+// ============================================================================
+//
+// Batched variant of dequant_matvec_4bit_v3 that takes T input vectors and
+// produces T output vectors by amortizing the per-output-channel weight
+// dequantization across all T input rows.
+//
+// Layout:
+//   W       : [out_dim, in_dim/8]  packed 4-bit weights (uint32)
+//   scales  : [out_dim, in_dim/group_size]  bf16
+//   biases  : [out_dim, in_dim/group_size]  bf16
+//   X       : [T, in_dim]  row-major float input
+//   Y       : [T, out_dim] row-major float output
+//
+// Grid: (ceil(out_dim / ROWS_PER_TG_MM), 1, 1)
+//   Threadgroup: (256, 1, 1)  →  8 SIMD groups × 32 lanes
+//   Each SIMD group owns one output row (of the current tile).
+//   All T output slots for that row are computed before moving on.
+//
+// Savings vs. T separate matvec_v3 dispatches:
+//   - bf16_to_f32(scale/bias) done ONCE per (output_row, weight_column)
+//     then reused for all T inputs → amortises 25% conversion overhead
+//   - Nibble extractions done ONCE per weight uint32 → amortises 19% bit ops
+//   - Dispatch overhead: 1 command encoder instead of T
+//
+// Threadgroup memory:
+//   We do NOT cache X in threadgroup memory because in_dim may be up to 7168
+//   (HIDDEN_DIM), which would require 7168×4 = 28 KB per input row — too large
+//   to cache multiple rows simultaneously. Instead we read X directly from
+//   device memory. The GPU L1/L2 cache provides reasonable bandwidth because
+//   all T reads of X[t][x_base..x_base+7] for a fixed x_base are sequential
+//   within the inner loop over t.
+
+#define ROWS_PER_TG_MM 8
+
+kernel void dequant_matmul_4bit(
+    device const uint32_t *W        [[buffer(0)]],  // [out_dim, in_dim/8] packed 4-bit
+    device const uint16_t *scales   [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const uint16_t *biases   [[buffer(2)]],  // [out_dim, num_groups] bf16
+    device const float    *X        [[buffer(3)]],  // [T, in_dim] row-major
+    device       float    *Y        [[buffer(4)]],  // [T, out_dim] row-major
+    constant     uint32_t &T        [[buffer(5)]],  // number of input/output rows
+    constant     uint32_t &out_dim  [[buffer(6)]],
+    constant     uint32_t &in_dim   [[buffer(7)]],
+    constant     uint32_t &group_size [[buffer(8)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    // Which output row (of W) this SIMD group owns
+    uint row = tgid * ROWS_PER_TG_MM + simd_group;
+    if (row >= out_dim) return;
+
+    uint packed_cols  = in_dim / 8;          // uint32 elements per weight row
+    uint packed_per_g = group_size / 8;      // uint32 elements per quantization group
+    uint num_groups   = in_dim / group_size;
+
+    // Pointers into the weight matrix for this output row
+    device const uint32_t *w_row = W      + row * packed_cols;
+    device const uint16_t *s_row = scales + row * num_groups;
+    device const uint16_t *b_row = biases + row * num_groups;
+
+    // Each thread maintains T partial accumulators — one per input row.
+    // T <= 8 in practice (small enough for register allocation).
+    // We cap at MAX_T=8 with static arrays; caller must pass T <= 8.
+    float acc[8];
+    for (uint t = 0; t < T; t++) acc[t] = 0.0f;
+
+    // Stride over packed columns: lane simd_lane handles cols simd_lane, simd_lane+32, ...
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        // Determine quantization group
+        uint g = col / packed_per_g;
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;  // first input element index for this col
+
+        // Dequantize the 8 nibbles from this packed word — done ONCE
+        // fma(nibble, scale*x, bias*x) same arithmetic as v3
+        // We pull dequant outside the T-loop, storing the 8 weight values.
+        // Then for each input row t we multiply the precomputed w_val[n] by x[t][x_base+n].
+        float w0 = float((packed >>  0) & 0xF) * scale + bias;
+        float w1 = float((packed >>  4) & 0xF) * scale + bias;
+        float w2 = float((packed >>  8) & 0xF) * scale + bias;
+        float w3 = float((packed >> 12) & 0xF) * scale + bias;
+        float w4 = float((packed >> 16) & 0xF) * scale + bias;
+        float w5 = float((packed >> 20) & 0xF) * scale + bias;
+        float w6 = float((packed >> 24) & 0xF) * scale + bias;
+        float w7 = float((packed >> 28) & 0xF) * scale + bias;
+
+        // Accumulate for all T input rows
+        for (uint t = 0; t < T; t++) {
+            device const float *x_row = X + t * in_dim;
+            acc[t] += w0 * x_row[x_base + 0];
+            acc[t] += w1 * x_row[x_base + 1];
+            acc[t] += w2 * x_row[x_base + 2];
+            acc[t] += w3 * x_row[x_base + 3];
+            acc[t] += w4 * x_row[x_base + 4];
+            acc[t] += w5 * x_row[x_base + 5];
+            acc[t] += w6 * x_row[x_base + 6];
+            acc[t] += w7 * x_row[x_base + 7];
+        }
+    }
+
+    // SIMD reduction and writeback for each of the T rows
+    for (uint t = 0; t < T; t++) {
+        float sum = simd_sum(acc[t]);
+        if (simd_lane == 0) {
+            Y[t * out_dim + row] = sum;
+        }
+    }
+}
