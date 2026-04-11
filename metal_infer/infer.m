@@ -185,25 +185,6 @@ static uint64_t g_pred_hits = 0;
 static uint64_t g_pred_misses = 0;
 static uint64_t g_pred_layers = 0;
 
-// TQ debugging — gated by TQ_KV_DBG=1, prints per-layer hashes during generation
-// to find where TQ-enabled inference diverges from baseline.
-static int g_tq_dbg = 0;
-static inline uint64_t tq_dbg_hash_floats(const float *p, int n) {
-    // Cheap deterministic hash of a float vector — XOR of FNV-1a-folded bits.
-    uint64_t h = 1469598103934665603ULL;  // FNV offset basis
-    const uint32_t *u = (const uint32_t *)p;
-    for (int i = 0; i < n; i++) {
-        h ^= (uint64_t)u[i];
-        h *= 1099511628211ULL;             // FNV prime
-    }
-    return h;
-}
-static inline float tq_dbg_l2(const float *p, int n) {
-    double s = 0.0;
-    for (int i = 0; i < n; i++) s += (double)p[i] * (double)p[i];
-    return (float)sqrt(s);
-}
-
 // Routing data collection for training an expert predictor
 // Binary format per sample: int32 layer_idx, int32 K, float32[4096] hidden, int32[K] expert_indices
 static FILE *g_routing_log = NULL;
@@ -6858,8 +6839,6 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        // TQ debug instrumentation toggle (per-layer hidden hash + KV cache hash)
-        if (getenv("TQ_KV_DBG") && atoi(getenv("TQ_KV_DBG")) == 1) g_tq_dbg = 1;
         const char *model_path = MODEL_PATH_DEFAULT;
         const char *weights_path = NULL;
         const char *manifest_path = NULL;
@@ -7380,26 +7359,6 @@ int main(int argc, char **argv) {
                                     pos,
                                     layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                     K, layer_fds[layer]);
-                if (g_tq_dbg) {
-                    // Force completion of any deferred GPU work so the CPU read
-                    // we're about to do reflects this layer's output, not next.
-                    complete_deferred_experts();
-                    uint64_t hh = tq_dbg_hash_floats(hidden, HIDDEN_DIM);
-                    float    hl = tq_dbg_l2(hidden, HIDDEN_DIM);
-                    if (is_full) {
-                        // Hash this full-attn layer's CPU KV cache up to current pos+1
-                        KVCache *kvc = kv_caches[layer];
-                        int kv_dim = NUM_KV_HEADS * HEAD_DIM;
-                        int len = kvc->len;
-                        uint64_t kh = tq_dbg_hash_floats(kvc->k_cache, len * kv_dim);
-                        uint64_t vh = tq_dbg_hash_floats(kvc->v_cache, len * kv_dim);
-                        fprintf(stderr, "[tq_dbg] gen=%d L=%2d FULL  hidden_hash=%016llx l2=%.4f kv_len=%d k_hash=%016llx v_hash=%016llx\n",
-                                gen, layer, hh, hl, len, kh, vh);
-                    } else {
-                        fprintf(stderr, "[tq_dbg] gen=%d L=%2d lin   hidden_hash=%016llx l2=%.4f\n",
-                                gen, layer, hh, hl);
-                    }
-                }
             }
             // Complete last layer's deferred GPU experts before final norm
             complete_deferred_experts();
