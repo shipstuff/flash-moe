@@ -9534,20 +9534,91 @@ static int test_multi_slot_full_attn(WeightFile *wf, const char *arg) {
     double parallel_per_op_us = t_parallel_us / (iters * T);
     double parallel_per_batch_us = t_parallel_us / iters;
 
+    // ---- Test C: multi_slot_full_attn_layer (Phase 1c, REAL CPU work included) ----
+    // This uses the Phase 1c multi-slot driver which includes RoPE, QK norm,
+    // KV cache writes — the full per-layer wall clock, not just GPU kernels.
+    // To measure correctly, we need a KVCache struct for the test.
+    double t_real_multi_us = 0;
+    double t_real_serial_us = 0;
+    int real_iters = iters;
+    if (T > 1) {
+        init_multi_slot_bufs(g_metal);
+        int real_kv_dim = NUM_KV_HEADS * HEAD_DIM;
+
+        // Allocate a KV cache for the test
+        size_t kv_cap = GPU_KV_SEQ;
+        float *kv_k = calloc(kv_cap * real_kv_dim, sizeof(float));
+        float *kv_v = calloc(kv_cap * real_kv_dim, sizeof(float));
+        KVCache test_kv = { .k_cache = kv_k, .v_cache = kv_v, .len = kv_len };
+
+        // Pre-fill the GPU KV mirror to kv_len positions (same random data as test A/B)
+        // (already done above in the shared KV cache init)
+
+        // Scratch for T hidden states
+        float *hidden_chunk = calloc((size_t)T * HIDDEN_DIM, sizeof(float));
+
+        // Test C-serial: T calls to multi_slot_full_attn_layer with T=1 each
+        // (same function but serial — measures the overhead of the new code path)
+        {
+            CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+            for (int i = 0; i < real_iters; i++) {
+                test_kv.len = kv_len;  // reset
+                for (int t = 0; t < T; t++) {
+                    // Random hidden state per slot
+                    for (int d = 0; d < HIDDEN_DIM; d++)
+                        hidden_chunk[d] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
+                    multi_slot_full_attn_layer(wf, layer_idx, hidden_chunk, 1, &test_kv, kv_len + i*T + t);
+                    test_kv.len = kv_len;  // reset after each
+                }
+            }
+            t_real_serial_us = (CFAbsoluteTimeGetCurrent() - t0) * 1e6;
+        }
+
+        // Test C-parallel: multi_slot_full_attn_layer with T tokens at once
+        {
+            CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+            for (int i = 0; i < real_iters; i++) {
+                test_kv.len = kv_len;  // reset
+                // Random hidden states for all T slots
+                for (int d = 0; d < T * HIDDEN_DIM; d++)
+                    hidden_chunk[d] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
+                multi_slot_full_attn_layer(wf, layer_idx, hidden_chunk, T, &test_kv, kv_len + i*T);
+                test_kv.len = kv_len;  // reset
+            }
+            t_real_multi_us = (CFAbsoluteTimeGetCurrent() - t0) * 1e6;
+        }
+
+        free(hidden_chunk);
+        free(kv_k);
+        free(kv_v);
+    }
+
+    double real_serial_per_op = t_real_serial_us / (real_iters * T);
+    double real_multi_per_op = t_real_multi_us / (real_iters * T);
+    double real_multi_per_batch = t_real_multi_us / real_iters;
+    double real_speedup = (real_multi_per_op > 0) ? real_serial_per_op / real_multi_per_op : 0;
+
     double speedup = serial_per_op_us / parallel_per_op_us;
     double throughput_ratio = (double)T / (parallel_per_batch_us / serial_per_op_us);
 
     printf("=== Results ===\n");
-    printf("  Serial (T=%d back-to-back on 1 queue):\n", T);
+    printf("  Test A — Serial GPU-only (T=%d back-to-back on 1 queue):\n", T);
     printf("    per-op:    %7.3f ms\n", serial_per_op_us / 1000.0);
     printf("    total:     %7.3f ms  (%d iters x T=%d ops)\n",
            t_serial_us / 1000.0, iters, T);
-    printf("  Parallel (T=%d queues, T cmd bufs per iter):\n", T);
+    printf("  Test B — Parallel GPU-only (T=%d queues, T cmd bufs per iter):\n", T);
     printf("    per-op:    %7.3f ms\n", parallel_per_op_us / 1000.0);
     printf("    per-batch: %7.3f ms  (wall time for T concurrent bufs)\n",
            parallel_per_batch_us / 1000.0);
     printf("    total:     %7.3f ms  (%d iters)\n",
            t_parallel_us / 1000.0, iters);
+    if (T > 1) {
+        printf("  Test C — Real multi-slot (GPU + CPU RoPE/QK norm/KV cache, Phase 1c):\n");
+        printf("    serial per-op:   %7.3f ms  (T=1 × %d)\n", real_serial_per_op / 1000.0, T);
+        printf("    parallel per-op: %7.3f ms  (T=%d multi-slot)\n", real_multi_per_op / 1000.0, T);
+        printf("    parallel batch:  %7.3f ms\n", real_multi_per_batch / 1000.0);
+        printf("    real speedup:    %.2fx  (includes all CPU overhead)\n", real_speedup);
+    }
     printf("\n");
     printf("=== Decision gate ===\n");
     printf("  Speedup per op (serial / parallel): %.2fx   (ideal T=%d, dead 1)\n",
