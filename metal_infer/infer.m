@@ -9061,20 +9061,48 @@ static void multi_slot_full_attn_layer(
     if (fa_idx < 0 || fa_idx >= NUM_FULL_ATTN_LAYERS) return;
     if (!lc->q_w || !lc->o_w || !lc->post_attn_norm_w || !lc->gate_w) return;
 
-    // ---- Step 1: CPU input norm for each slot ----
-    for (int t = 0; t < T; t++) {
-        float *hidden_t = hidden_batch + (size_t)t * HIDDEN_DIM;
-        float *norm_dst = (float *)[g_metal->buf_input_slot[t] contents];
-        cpu_rms_norm(hidden_t, lc->input_norm_w, norm_dst, HIDDEN_DIM, RMS_NORM_EPS);
-        // Save residual for CMD2's residual_add
-        memcpy([g_metal->buf_residual_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
-    }
-
-    // ---- Step 2: Dispatch T CMD1 (projections) in parallel ----
+    // ---- Step 1+2: GPU input norm + projections in parallel ----
+    // Use GPU rms_norm_apply_bf16 (not CPU cpu_rms_norm) to match the serial
+    // fast-path's precision. CPU fp32 norm vs GPU bf16 norm causes cascading
+    // divergence through delta-net state updates → degenerate output.
     id<MTLCommandBuffer> cmd1s[MAX_MULTI_T];
     for (int t = 0; t < T; t++) {
+        float *hidden_t = hidden_batch + (size_t)t * HIDDEN_DIM;
+        // Copy raw hidden → buf_input_slot[t] (for GPU norm in-place)
+        memcpy([g_metal->buf_input_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
+        // Save residual for CMD2's residual_add
+        memcpy([g_metal->buf_residual_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
+
         SlotFullAttnBufs sb = get_slot_bufs_from_ctx(g_metal, t);
         cmd1s[t] = [g_metal->queue_slot[t] commandBuffer];
+
+        // GPU norm: rms_norm_sum + rms_norm_apply_bf16 (in-place on buf_input_slot[t])
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd1s[t] computeCommandEncoder];
+            uint32_t dim = HIDDEN_DIM;
+            [enc setComputePipelineState:g_metal->rms_norm_sum];
+            [enc setBuffer:sb.buf_input  offset:0 atIndex:0];
+            [enc setBuffer:sb.buf_sum_sq offset:0 atIndex:1];
+            [enc setBytes:&dim length:4 atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+        {
+            NSUInteger norm_off = (NSUInteger)((const char *)lc->input_norm_w - (const char *)[g_metal->wf_buf contents]);
+            id<MTLComputeCommandEncoder> enc = [cmd1s[t] computeCommandEncoder];
+            uint32_t dim = HIDDEN_DIM; float eps = RMS_NORM_EPS;
+            [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
+            [enc setBuffer:sb.buf_input  offset:0        atIndex:0];
+            [enc setBuffer:g_metal->wf_buf offset:norm_off atIndex:1];
+            [enc setBuffer:sb.buf_sum_sq offset:0        atIndex:2];
+            [enc setBuffer:sb.buf_input  offset:0        atIndex:3]; // in-place
+            [enc setBytes:&dim length:4 atIndex:4];
+            [enc setBytes:&eps length:4 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((dim+255)/256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+
+        // Projections (read from GPU-normed buf_input_slot[t])
         encode_slot_cmd1_proj(cmd1s[t], &sb, lc);
         [cmd1s[t] commit];
     }
@@ -9305,21 +9333,47 @@ static void multi_slot_linear_attn_layer(
     int qkv_dim = LINEAR_CONV_DIM;
     int z_dim = LINEAR_TOTAL_VALUE;
 
-    // ---- Step 1: CPU input norm for each slot ----
-    for (int t = 0; t < T; t++) {
-        float *hidden_t = hidden_batch + (size_t)t * HIDDEN_DIM;
-        float *norm_dst = (float *)[g_metal->buf_input_slot[t] contents];
-        cpu_rms_norm(hidden_t, lc->input_norm_w, norm_dst, HIDDEN_DIM, RMS_NORM_EPS);
-        memcpy([g_metal->buf_residual_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
-    }
-
-    // ---- Step 2: Dispatch T projection CMD1s in parallel ----
+    // ---- Step 1+2: GPU input norm + projection CMD1s in parallel ----
+    // Use GPU rms_norm_apply_bf16 (not CPU cpu_rms_norm) to match the serial
+    // fast-path's precision. CPU fp32 vs GPU bf16 norm causes cascading
+    // divergence through delta-net state → degenerate output.
     MetalCtx *ctx = g_metal;
     id<MTLCommandBuffer> cmd1s[MAX_MULTI_T];
     for (int t = 0; t < T; t++) {
+        float *hidden_t = hidden_batch + (size_t)t * HIDDEN_DIM;
+        // Copy raw hidden → buf_input_slot[t] (for GPU norm in-place)
+        memcpy([ctx->buf_input_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
+        memcpy([ctx->buf_residual_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
+
         cmd1s[t] = [ctx->queue_slot[t] commandBuffer];
 
-        // Encode 4 projection matvecs using per-slot buf_input and batch_out
+        // GPU norm: rms_norm_sum + rms_norm_apply_bf16 (in-place on buf_input_slot[t])
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd1s[t] computeCommandEncoder];
+            uint32_t dim = HIDDEN_DIM;
+            [enc setComputePipelineState:ctx->rms_norm_sum];
+            [enc setBuffer:ctx->buf_input_slot[t]  offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_sum_sq_slot[t] offset:0 atIndex:1];
+            [enc setBytes:&dim length:4 atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+        {
+            NSUInteger norm_off = (NSUInteger)((const char *)lc->input_norm_w - (const char *)[ctx->wf_buf contents]);
+            id<MTLComputeCommandEncoder> enc = [cmd1s[t] computeCommandEncoder];
+            uint32_t dim = HIDDEN_DIM; float eps = RMS_NORM_EPS;
+            [enc setComputePipelineState:ctx->rms_norm_apply_bf16];
+            [enc setBuffer:ctx->buf_input_slot[t]  offset:0        atIndex:0];
+            [enc setBuffer:ctx->wf_buf             offset:norm_off atIndex:1];
+            [enc setBuffer:ctx->buf_sum_sq_slot[t] offset:0        atIndex:2];
+            [enc setBuffer:ctx->buf_input_slot[t]  offset:0        atIndex:3]; // in-place
+            [enc setBytes:&dim length:4 atIndex:4];
+            [enc setBytes:&eps length:4 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((dim+255)/256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+
+        // Encode 4 projection matvecs using per-slot GPU-normed buf_input and batch_out
         #define ENC_LA_MV(W, S_, B, OUT_SLOT, OUT_DIM) do { \
             NSUInteger w_off = (NSUInteger)((const char *)(W)  - (const char *)[ctx->wf_buf contents]); \
             NSUInteger s_off = (NSUInteger)((const char *)(S_) - (const char *)[ctx->wf_buf contents]); \
@@ -9475,6 +9529,283 @@ static void multi_slot_linear_attn_layer(
     for (int t = 0; t < T; t++) {
         float *hidden_t = hidden_batch + (size_t)t * HIDDEN_DIM;
         memcpy(hidden_t, [ctx->buf_h_mid_slot[t] contents], HIDDEN_DIM * sizeof(float));
+    }
+}
+
+// ============================================================================
+// Phase 2c: Per-token expert dispatch after multi-slot layer returns.
+//
+// Reads routing results from per-slot buffers (batch_out_slot[t][3] = gate_scores,
+// buf_shared_gate_slot[t] = shared gate, buf_shared_up_slot[t] = shared up,
+// buf_shared_out_slot[t] = shared_expert_gate_score).
+// Dispatches K experts serially using slot-0 Metal buffers.
+// Uses the GPU combine path (moe_combine_residual) for efficiency.
+// ============================================================================
+static void multi_slot_expert_dispatch_token(
+    int layer_idx,
+    float *hidden,        // [HIDDEN_DIM] in/out — h_mid on input, combined on output
+    int t,                // which slot's results to use
+    int K,
+    int packed_fd,
+    const void *mmap_base
+) {
+    MetalCtx *ctx = g_metal;
+    LayerWeightCache *lc = &layer_cache[layer_idx];
+
+    // Read gate_scores from per-slot buffer
+    float gate_scores[NUM_EXPERTS];
+    memcpy(gate_scores, [ctx->batch_out_slot[t][3] contents], NUM_EXPERTS * sizeof(float));
+
+    // Softmax + topK routing
+    cpu_softmax(gate_scores, NUM_EXPERTS);
+    int expert_indices[64];
+    float expert_weights[64];
+    cpu_topk(gate_scores, NUM_EXPERTS, K, expert_indices, expert_weights);
+    cpu_normalize_weights(expert_weights, K);
+
+    int actual_K = (K > MAX_K) ? MAX_K : K;
+
+    // Read h_post from buf_input_slot[t] → shared buf_multi_expert_input
+    memcpy([ctx->buf_multi_expert_input contents],
+           [ctx->buf_input_slot[t] contents], HIDDEN_DIM * sizeof(float));
+
+    // Copy shared expert gate/up from per-slot to shared buffers
+    memcpy([ctx->buf_shared_gate contents],
+           [ctx->buf_shared_gate_slot[t] contents], SHARED_INTERMEDIATE * sizeof(float));
+    memcpy([ctx->buf_shared_up contents],
+           [ctx->buf_shared_up_slot[t] contents], SHARED_INTERMEDIATE * sizeof(float));
+
+    // Read shared_expert_gate_score (1 float from buf_shared_out_slot[t])
+    float shared_gate_score;
+    memcpy(&shared_gate_score, [ctx->buf_shared_out_slot[t] contents], sizeof(float));
+
+    // Pread K experts into buf_multi_expert_data[k]
+    size_t esz = active_expert_size();
+    int valid[MAX_K];
+    id<MTLBuffer> expert_bufs[MAX_K];
+
+    if (g_malloc_cache) {
+        int miss_indices[MAX_K];
+        int miss_cache_idx[MAX_K];
+        int num_misses = 0;
+        for (int k = 0; k < actual_K; k++) {
+            id<MTLBuffer> cached = malloc_cache_lookup(g_malloc_cache, layer_idx, expert_indices[k]);
+            if (cached) {
+                expert_bufs[k] = cached;
+                valid[k] = 1;
+            } else {
+                int cidx = -1;
+                id<MTLBuffer> buf = malloc_cache_insert(g_malloc_cache, layer_idx, expert_indices[k], &cidx);
+                expert_bufs[k] = buf;
+                miss_indices[num_misses] = k;
+                miss_cache_idx[num_misses] = cidx;
+                num_misses++;
+                valid[k] = 0;
+            }
+        }
+        if (num_misses > 0) {
+            InferPreadTask tasks[MAX_K];
+            memset(tasks, 0, sizeof(tasks));
+            for (int m = 0; m < num_misses; m++) {
+                int k = miss_indices[m];
+                int cidx = miss_cache_idx[m];
+                tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
+                tasks[m].dst = g_malloc_cache->data[cidx];
+                tasks[m].offset = (off_t)expert_indices[k] * esz;
+                tasks[m].size = esz;
+                tasks[m].mmap_base = NULL;
+            }
+            io_pool_dispatch(tasks, num_misses);
+            for (int m = 0; m < num_misses; m++) {
+                int k = miss_indices[m];
+                valid[k] = (tasks[m].result == (ssize_t)esz);
+            }
+        }
+    } else {
+        // No cache: parallel pread into buf_multi_expert_data[k]
+        InferPreadTask tasks[MAX_K];
+        memset(tasks, 0, sizeof(tasks));
+        for (int k = 0; k < actual_K; k++) {
+            tasks[k].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
+            tasks[k].dst = [ctx->buf_multi_expert_data[k] contents];
+            tasks[k].offset = (off_t)expert_indices[k] * esz;
+            tasks[k].size = esz;
+            tasks[k].mmap_base = mmap_base;
+            expert_bufs[k] = ctx->buf_multi_expert_data[k];
+        }
+        io_pool_dispatch(tasks, actual_K);
+        for (int k = 0; k < actual_K; k++) {
+            valid[k] = (tasks[k].result == (ssize_t)esz);
+        }
+    }
+
+    // Copy h_mid to buf_h_mid (for GPU combine kernel)
+    memcpy([ctx->buf_h_mid contents], hidden, HIDDEN_DIM * sizeof(float));
+
+    // GPU CMD3: expert forwards + shared SwiGLU + down_proj + combine
+    id<MTLCommandBuffer> cmd3 = [ctx->queue commandBuffer];
+
+    // Expert forwards (batched encoding)
+    gpu_encode_experts_batched(ctx, cmd3, actual_K, valid, expert_bufs);
+
+    // Shared SwiGLU
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd3 computeCommandEncoder];
+        [enc setComputePipelineState:ctx->swiglu];
+        [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_shared_up   offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_shared_act  offset:0 atIndex:2];
+        uint32_t dim = SHARED_INTERMEDIATE;
+        [enc setBytes:&dim length:4 atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((dim + 255) / 256, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    // Shared down_proj
+    if (lc->sd_w && lc->sd_s && lc->sd_b) {
+        gpu_encode_dequant_matvec_with_io_bufs(
+            ctx, cmd3, lc->sd_w, lc->sd_s, lc->sd_b,
+            ctx->buf_shared_act, ctx->buf_shared_out,
+            HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+    }
+
+    // GPU combine: moe_combine_residual
+    if (ctx->moe_combine_residual) {
+        float *params = (float *)[ctx->buf_combine_params contents];
+        memset(params, 0, 10 * sizeof(float));
+        for (int k = 0; k < actual_K; k++) {
+            params[k] = valid[k] ? expert_weights[k] : 0.0f;
+        }
+        params[8] = shared_gate_score;
+
+        id<MTLComputeCommandEncoder> enc = [cmd3 computeCommandEncoder];
+        [enc setComputePipelineState:ctx->moe_combine_residual];
+        [enc setBuffer:ctx->buf_h_mid      offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_shared_out offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:2];
+        for (int k = 0; k < MAX_K; k++) {
+            [enc setBuffer:ctx->buf_multi_expert_out[k] offset:0 atIndex:(3 + k)];
+        }
+        [enc setBuffer:ctx->buf_combine_params offset:0 atIndex:11];
+        uint32_t dim = HIDDEN_DIM;
+        uint32_t k_val = (uint32_t)actual_K;
+        [enc setBytes:&dim   length:4 atIndex:12];
+        [enc setBytes:&k_val length:4 atIndex:13];
+        [enc dispatchThreadgroups:MTLSizeMake((dim + 255) / 256, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    [cmd3 commit];
+    [cmd3 waitUntilCompleted];
+
+    // Read back combined hidden state
+    if (ctx->moe_combine_residual) {
+        memcpy(hidden, [ctx->buf_moe_hidden contents], HIDDEN_DIM * sizeof(float));
+    } else {
+        // CPU fallback combine
+        float moe_out[HIDDEN_DIM];
+        memset(moe_out, 0, sizeof(moe_out));
+        for (int k = 0; k < actual_K; k++) {
+            if (!valid[k]) continue;
+            float *eo = (float *)[ctx->buf_multi_expert_out[k] contents];
+            cpu_vec_madd(moe_out, eo, expert_weights[k], HIDDEN_DIM);
+        }
+        float *so = (float *)[ctx->buf_shared_out contents];
+        float sw = cpu_sigmoid(shared_gate_score);
+        for (int i = 0; i < HIDDEN_DIM; i++) {
+            hidden[i] += moe_out[i] + so[i] * sw;
+        }
+    }
+}
+
+// ============================================================================
+// Phase 2c: Full multi-slot prefill driver
+//
+// Processes T prefill tokens through all 60 layers using:
+//   - multi_slot_full_attn_layer for full-attention layers (GPU parallel dispatch)
+//   - multi_slot_linear_attn_layer for linear-attention layers (parallel projections)
+//   - multi_slot_expert_dispatch_token per token per layer (serial expert dispatch)
+//
+// Gated by MULTI_SLOT_PREFILL=1 env var via the multi_slot_prefill_enabled flag.
+// Falls back to fused_layer_forward per-token if disabled.
+// ============================================================================
+static int g_multi_slot_prefill_enabled = -1;  // -1 = not checked, 0 = off, 1 = on
+
+static void multi_slot_prefill_chunk(
+    WeightFile *wf,
+    float *hidden_chunk,   // [T * HIDDEN_DIM] in/out
+    int T,
+    KVCache **kv_caches,
+    LinearAttnState **layer_states,
+    int *layer_fds,
+    void **layer_mmaps,
+    int K,
+    int pos_start
+) {
+    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+
+        // Step 1: Multi-slot attention + routing (parallel on GPU)
+        if (is_full) {
+            KVCache *kv = kv_caches[layer];
+            if (kv && kv->len >= 32 && g_metal->attn_scores_pipe) {
+                multi_slot_full_attn_layer(wf, layer, hidden_chunk, T, kv, pos_start);
+            } else {
+                // Fallback: serial per-token for short kv_len or missing pipeline
+                for (int t = 0; t < T; t++) {
+                    g_current_slot = 0;
+                    if (g_deferred.active) complete_deferred_experts();
+                    fused_layer_forward(wf, layer,
+                                        hidden_chunk + (size_t)t * HIDDEN_DIM,
+                                        kv, NULL, pos_start + t,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                // After serial fallback, hidden is updated with MoE — skip expert dispatch below
+                continue;
+            }
+        } else {
+            LinearAttnState *la = layer_states[layer];
+            if (la && g_metal->delta_net_step && g_metal->conv1d_step) {
+                multi_slot_linear_attn_layer(wf, layer, hidden_chunk, T, la, pos_start);
+            } else {
+                // Fallback: serial per-token
+                for (int t = 0; t < T; t++) {
+                    g_current_slot = 0;
+                    if (g_deferred.active) complete_deferred_experts();
+                    fused_layer_forward(wf, layer,
+                                        hidden_chunk + (size_t)t * HIDDEN_DIM,
+                                        NULL, la, pos_start + t,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                continue;
+            }
+        }
+
+        // Step 2: Expert dispatch per token (serial — uses slot-0 Metal buffers)
+        for (int t = 0; t < T; t++) {
+            multi_slot_expert_dispatch_token(
+                layer,
+                hidden_chunk + (size_t)t * HIDDEN_DIM,
+                t, K, layer_fds[layer],
+                layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL);
+        }
+
+        // Debug: per-layer hash + first values after expert dispatch
+        if (getenv("MULTI_SLOT_DBG")) {
+            for (int t = 0; t < T; t++) {
+                float *hd = hidden_chunk + (size_t)t * HIDDEN_DIM;
+                uint64_t h = batch_prefill_dbg_hash(hd, HIDDEN_DIM);
+                float rms = 0; for (int i=0; i<HIDDEN_DIM; i++) rms += hd[i]*hd[i];
+                rms = sqrtf(rms / HIDDEN_DIM);
+                fprintf(stderr, "MSDBG layer=%02d t=%d hash=%016llx rms=%.6f first=[%.6f,%.6f,%.6f,%.6f]\n",
+                        layer, t, (unsigned long long)h, rms,
+                        hd[0], hd[1], hd[2], hd[3]);
+            }
+        }
     }
 }
 
@@ -10476,9 +10807,49 @@ int main(int argc, char **argv) {
             double first_tok_ms = 0;
             int intermediate_count = pt->count - 1;
 
-            if (batch_prefill_T > 1) {
-                // Chunked prefill: run T tokens together per layer.
-                // Allocate a (T, HIDDEN_DIM) scratch we can reuse across chunks.
+            // Check MULTI_SLOT_PREFILL env var (once)
+            if (g_multi_slot_prefill_enabled < 0) {
+                const char *ms = getenv("MULTI_SLOT_PREFILL");
+                g_multi_slot_prefill_enabled = (ms && ms[0] == '1') ? 1 : 0;
+                if (g_multi_slot_prefill_enabled) {
+                    fprintf(stderr, "[multi-slot] MULTI_SLOT_PREFILL=1: using Phase 2 "
+                            "multi-slot prefill with parallel projections\n");
+                }
+            }
+
+            if (g_multi_slot_prefill_enabled && batch_prefill_T > 1) {
+                // ---- Phase 2c: Multi-slot prefill ----
+                // Uses parallel GPU dispatch for projections + serial recurrence
+                // for linear-attention + serial expert dispatch per token.
+                int T_ms = batch_prefill_T;
+                if (T_ms > MAX_MULTI_T) T_ms = MAX_MULTI_T;
+                float *hidden_chunk = malloc((size_t)T_ms * HIDDEN_DIM * sizeof(float));
+                int processed = 0;
+                while (processed < intermediate_count) {
+                    int T_now = intermediate_count - processed;
+                    if (T_now > T_ms) T_now = T_ms;
+                    double t_chunk = now_ms();
+
+                    for (int t = 0; t < T_now; t++) cache_telemetry_note_token();
+                    memcpy(hidden_chunk,
+                           embed_batch + (size_t)processed * HIDDEN_DIM,
+                           (size_t)T_now * HIDDEN_DIM * sizeof(float));
+
+                    multi_slot_prefill_chunk(wf, hidden_chunk, T_now,
+                                             kv_caches, layer_states,
+                                             layer_fds, (void **)layer_mmaps,
+                                             K, pos);
+
+                    pos += T_now;
+                    g_gen_tok_counter += T_now;
+
+                    double t_chunk_end = now_ms();
+                    if (processed == 0) first_tok_ms = (t_chunk_end - t_chunk) / T_now;
+                    processed += T_now;
+                }
+                free(hidden_chunk);
+            } else if (batch_prefill_T > 1) {
+                // Chunked prefill: run T tokens together per layer (cold-cache-only legacy).
                 float *hidden_chunk = malloc((size_t)batch_prefill_T * HIDDEN_DIM * sizeof(float));
                 int processed = 0;
                 while (processed < intermediate_count) {
@@ -10486,10 +10857,7 @@ int main(int argc, char **argv) {
                     if (T_now > batch_prefill_T) T_now = batch_prefill_T;
                     double t_chunk = now_ms();
 
-                    // Load T pre-embedded tokens
-                    for (int t = 0; t < T_now; t++) {
-                        cache_telemetry_note_token();
-                    }
+                    for (int t = 0; t < T_now; t++) cache_telemetry_note_token();
                     memcpy(hidden_chunk,
                            embed_batch + (size_t)processed * HIDDEN_DIM,
                            (size_t)T_now * HIDDEN_DIM * sizeof(float));
