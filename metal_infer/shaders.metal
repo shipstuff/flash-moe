@@ -2364,11 +2364,15 @@ kernel void fullattn_norm_rope_kv(
         float v_val = v_proj[h * head_dim + d];
         kv_v[cache_pos * kv_dim + h * head_dim + d] = v_val;
 
-        // Write fp16 KV cache (for fused flash-attention)
-        threadgroup_barrier(mem_flags::mem_device);  // ensure RoPE writes are visible
-        uint f16_off = cache_pos * kv_dim + h * head_dim + d;
-        kv_k_f16[f16_off] = (half)kv_k[f16_off];
-        kv_v_f16[f16_off] = (half)v_val;
+        // Write fp16 KV cache (for fused flash-attention, non-TQ only)
+        // In TQ mode, kv_k_f16/kv_v_f16 alias the float encode buffers — skip
+        // the half write to avoid corrupting the float data.
+        if (kv_k_f16 != (device half*)kv_k) {
+            threadgroup_barrier(mem_flags::mem_device);  // ensure RoPE writes are visible
+            uint f16_off = cache_pos * kv_dim + h * head_dim + d;
+            kv_k_f16[f16_off] = (half)kv_k[f16_off];
+            kv_v_f16[f16_off] = (half)v_val;
+        }
     }
 }
 
@@ -2381,7 +2385,7 @@ kernel void fullattn_norm_rope_kv(
 kernel void tq_rotate_q(
     device const float* Q_in     [[buffer(0)]],  // [NUM_ATTN_HEADS, HEAD_DIM]
     device const float* Pi       [[buffer(1)]],  // [HEAD_DIM, HEAD_DIM] row-major
-    device       float* Q_out    [[buffer(2)]],  // [NUM_ATTN_HEADS, HEAD_DIM]
+    device       float* Q_out    [[buffer(2)]],  // [NUM_ATTN_HEADS, HEAD_DIM] (may alias Q_in)
     uint tgid [[threadgroup_position_in_grid]],   // head index
     uint lid  [[thread_position_in_threadgroup]]   // output dimension d
 ) {
@@ -2389,10 +2393,16 @@ kernel void tq_rotate_q(
     uint h = tgid;
     uint d = lid;
 
+    // Cache Q[h,:] in threadgroup memory to allow safe in-place rotation.
+    // Without this, threads writing Q_out[h,d] race with threads reading Q_in[h,j].
+    threadgroup float q_shared[HEAD_DIM];
+    q_shared[lid] = Q_in[h * HEAD_DIM + lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // out[h,d] = sum_j Q[h,j] * Pi^T[j,d] = sum_j Q[h,j] * Pi[d,j]
     float acc = 0.0f;
     for (uint j = 0; j < HEAD_DIM; j++) {
-        acc += Q_in[h * HEAD_DIM + j] * Pi[d * HEAD_DIM + j];
+        acc += q_shared[j] * Pi[d * HEAD_DIM + j];
     }
     Q_out[h * HEAD_DIM + d] = acc;
 }
