@@ -947,6 +947,13 @@ static void cpu_conv1d_step(
 // Used for encoding multiple matmuls into one command buffer.
 #define MAX_BATCH_SLOTS 8
 
+// Maximum number of parallel token "slots" for the multi-buffer Approach A
+// prefill pipeline. Each slot has its own set of scratch GPU buffers so that
+// T tokens can run through the layer stack in lockstep on separate Metal
+// command queues. Phase 0 (commit d62e246) showed T=2 captures most of the
+// GPU parallel headroom (~1.5x), with diminishing returns past T=4.
+#define MAX_MULTI_T 4
+
 typedef struct {
     id<MTLDevice>               device;
     id<MTLCommandQueue>         queue;
@@ -1073,6 +1080,51 @@ typedef struct {
     id<MTLBuffer> buf_batch_vproj;       // [MAX_BATCH_T, NUM_KV_HEADS*HEAD_DIM] float
     id<MTLBuffer> buf_batch_oproj_in;    // [MAX_BATCH_T, NUM_ATTN_HEADS*HEAD_DIM] float
     id<MTLBuffer> buf_batch_oproj_out;   // [MAX_BATCH_T, HIDDEN_DIM] float
+
+    // ====================================================================
+    // Phase 1: Multi-slot buffers for Approach A (multi-buffered deferred
+    // state). Each slot has independent scratch buffers so T tokens can
+    // run through the layer stack in lockstep on separate command queues.
+    //
+    // Design: buf_*_slot[0] aliases the original buf_* (no extra alloc).
+    // The existing single-token path continues using buf_* directly and
+    // is completely unaffected. The multi-slot prefill driver uses
+    // buf_*_slot[t] for slot t.
+    //
+    // Memory: Tier 1 (CMD1+CMD2 scratch) ~5 MB at MAX_MULTI_T=4.
+    //         Tier 2 (CMD3 expert scratch) deferred to Phase 1c.
+    // ====================================================================
+
+    // Per-slot command queues (queue_slot[0] = main queue)
+    id<MTLCommandQueue> queue_slot[MAX_MULTI_T];
+
+    // Tier 1: CMD1 + CMD2 scratch — needed for parallel full-attention dispatch
+    id<MTLBuffer> buf_input_slot[MAX_MULTI_T];        // [HIDDEN_DIM]
+    id<MTLBuffer> buf_output_slot[MAX_MULTI_T];       // [HIDDEN_DIM]
+    id<MTLBuffer> buf_residual_slot[MAX_MULTI_T];     // [HIDDEN_DIM]
+    id<MTLBuffer> buf_h_mid_slot[MAX_MULTI_T];        // [HIDDEN_DIM]
+    id<MTLBuffer> buf_sum_sq_slot[MAX_MULTI_T];       // [1]
+    id<MTLBuffer> buf_attn_q_slot[MAX_MULTI_T];       // [NUM_ATTN_HEADS * HEAD_DIM]
+    id<MTLBuffer> buf_attn_gate_slot[MAX_MULTI_T];    // [NUM_ATTN_HEADS * HEAD_DIM]
+    id<MTLBuffer> buf_attn_out_slot[MAX_MULTI_T];     // [NUM_ATTN_HEADS * HEAD_DIM]
+    id<MTLBuffer> buf_attn_scores_slot[MAX_MULTI_T];  // [NUM_ATTN_HEADS * GPU_KV_SEQ]
+    id<MTLBuffer> batch_out_slot[MAX_MULTI_T][MAX_BATCH_SLOTS]; // projection outputs
+
+    // Tier 2: CMD3 expert scratch — deferred to Phase 1c.
+    // Will include: buf_multi_expert_data/gate/up/act/out per slot,
+    // buf_shared_gate/up/act/out per slot, buf_moe_hidden per slot,
+    // buf_combine_params per slot, buf_cmd3_sum_sq per slot.
+
+    // Tier 2 (partial, for sparse MoE batching across slots):
+    id<MTLBuffer> buf_moe_hidden_slot[MAX_MULTI_T];      // [HIDDEN_DIM]
+    id<MTLBuffer> buf_combine_params_slot[MAX_MULTI_T];   // [10 floats]
+    id<MTLBuffer> buf_cmd3_sum_sq_slot[MAX_MULTI_T];      // [1]
+    id<MTLBuffer> buf_shared_gate_slot[MAX_MULTI_T];      // [SHARED_INTERMEDIATE]
+    id<MTLBuffer> buf_shared_up_slot[MAX_MULTI_T];        // [SHARED_INTERMEDIATE]
+    id<MTLBuffer> buf_shared_act_slot[MAX_MULTI_T];       // [SHARED_INTERMEDIATE]
+    id<MTLBuffer> buf_shared_out_slot[MAX_MULTI_T];       // [HIDDEN_DIM]
+
+    int multi_slot_initialized;  // 0 until init_multi_slot_bufs() is called
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -1439,6 +1491,96 @@ static MetalCtx *metal_setup(void) {
 
     printf("[metal] Inference pipelines ready (multi-expert[%d] + shared buffers allocated)\n", MAX_K);
     return ctx;
+}
+
+// ============================================================================
+// Phase 1: Allocate per-slot buffers for multi-buffer Approach A.
+// Called lazily (only when multi-slot prefill is active).
+// Slot 0 aliases the original single-token buffers — zero extra allocation.
+// Slots 1..MAX_MULTI_T-1 get fresh allocations.
+// ============================================================================
+static void init_multi_slot_bufs(MetalCtx *ctx) {
+    if (ctx->multi_slot_initialized) return;
+    id<MTLDevice> dev = ctx->device;
+    int q_dim = NUM_ATTN_HEADS * HEAD_DIM;
+    int q_proj_dim = q_dim * 2;
+    int kv_dim = NUM_KV_HEADS * HEAD_DIM;
+    #define NEWBUF(bytes) [dev newBufferWithLength:(size_t)(bytes) options:MTLResourceStorageModeShared]
+
+    // Slot 0 = alias to existing single-token buffers
+    ctx->queue_slot[0] = ctx->queue;
+    ctx->buf_input_slot[0] = ctx->buf_input;
+    ctx->buf_output_slot[0] = ctx->buf_output;
+    ctx->buf_residual_slot[0] = ctx->buf_residual;
+    ctx->buf_h_mid_slot[0] = ctx->buf_h_mid;
+    ctx->buf_sum_sq_slot[0] = ctx->buf_sum_sq;
+    ctx->buf_attn_q_slot[0] = ctx->buf_attn_q;
+    ctx->buf_attn_gate_slot[0] = ctx->buf_attn_gate;
+    ctx->buf_attn_out_slot[0] = ctx->buf_attn_out;
+    ctx->buf_attn_scores_slot[0] = ctx->buf_attn_scores;
+    for (int s = 0; s < MAX_BATCH_SLOTS; s++)
+        ctx->batch_out_slot[0][s] = ctx->batch_out[s];
+    ctx->buf_moe_hidden_slot[0] = ctx->buf_moe_hidden;
+    ctx->buf_combine_params_slot[0] = ctx->buf_combine_params;
+    ctx->buf_cmd3_sum_sq_slot[0] = ctx->buf_cmd3_sum_sq;
+    ctx->buf_shared_gate_slot[0] = ctx->buf_shared_gate;
+    ctx->buf_shared_up_slot[0] = ctx->buf_shared_up;
+    ctx->buf_shared_act_slot[0] = ctx->buf_shared_act;
+    ctx->buf_shared_out_slot[0] = ctx->buf_shared_out;
+
+    // Slots 1..MAX_MULTI_T-1 = fresh allocations
+    size_t total_alloc = 0;
+    for (int t = 1; t < MAX_MULTI_T; t++) {
+        ctx->queue_slot[t] = [dev newCommandQueue];
+
+        ctx->buf_input_slot[t]   = NEWBUF(HIDDEN_DIM * sizeof(float));
+        ctx->buf_output_slot[t]  = NEWBUF(HIDDEN_DIM * sizeof(float));
+        ctx->buf_residual_slot[t]= NEWBUF(HIDDEN_DIM * sizeof(float));
+        ctx->buf_h_mid_slot[t]   = NEWBUF(HIDDEN_DIM * sizeof(float));
+        ctx->buf_sum_sq_slot[t]  = NEWBUF(sizeof(float));
+        ctx->buf_attn_q_slot[t]  = NEWBUF(q_dim * sizeof(float));
+        ctx->buf_attn_gate_slot[t]= NEWBUF(q_dim * sizeof(float));
+        ctx->buf_attn_out_slot[t] = NEWBUF(q_dim * sizeof(float));
+        ctx->buf_attn_scores_slot[t] = NEWBUF((size_t)NUM_ATTN_HEADS * GPU_KV_SEQ * sizeof(float));
+
+        // batch_out: allocate to max sizes used by projections
+        // slot 0=Q(q_proj_dim), 1=K(kv_dim), 2=V(kv_dim), 3=routing(NUM_EXPERTS),
+        // 4=shared_gate(SHARED_INTERMEDIATE), 5=shared_up(SHARED_INTERMEDIATE),
+        // 6=attn_output(value_dim or q_dim), 7=reserved
+        // For linear attn: 0=qkv(LINEAR_CONV_DIM), 1=z(LINEAR_TOTAL_VALUE),
+        //                  2=beta(LINEAR_NUM_V_HEADS), 3=alpha(LINEAR_NUM_V_HEADS)
+        int slot_sizes[MAX_BATCH_SLOTS] = {
+            q_proj_dim > (int)LINEAR_CONV_DIM ? q_proj_dim : (int)LINEAR_CONV_DIM,  // 0
+            kv_dim > (int)LINEAR_TOTAL_VALUE ? kv_dim : (int)LINEAR_TOTAL_VALUE,    // 1
+            kv_dim,                                                                  // 2
+            NUM_EXPERTS > (int)LINEAR_NUM_V_HEADS ? NUM_EXPERTS : (int)LINEAR_NUM_V_HEADS,  // 3
+            SHARED_INTERMEDIATE,  // 4
+            SHARED_INTERMEDIATE,  // 5
+            q_dim,                // 6 (for linear attn gated output or attn output)
+            HIDDEN_DIM,           // 7 (reserved)
+        };
+        for (int s = 0; s < MAX_BATCH_SLOTS; s++) {
+            ctx->batch_out_slot[t][s] = NEWBUF(slot_sizes[s] * sizeof(float));
+            total_alloc += slot_sizes[s] * sizeof(float);
+        }
+
+        // Tier 2 partial (combine/shared expert scratch)
+        ctx->buf_moe_hidden_slot[t]    = NEWBUF(HIDDEN_DIM * sizeof(float));
+        ctx->buf_combine_params_slot[t]= NEWBUF(10 * sizeof(float));
+        ctx->buf_cmd3_sum_sq_slot[t]   = NEWBUF(sizeof(float));
+        ctx->buf_shared_gate_slot[t]   = NEWBUF(SHARED_INTERMEDIATE * sizeof(float));
+        ctx->buf_shared_up_slot[t]     = NEWBUF(SHARED_INTERMEDIATE * sizeof(float));
+        ctx->buf_shared_act_slot[t]    = NEWBUF(SHARED_INTERMEDIATE * sizeof(float));
+        ctx->buf_shared_out_slot[t]    = NEWBUF(HIDDEN_DIM * sizeof(float));
+
+        total_alloc += (4*HIDDEN_DIM + 1 + q_dim*3 + (size_t)NUM_ATTN_HEADS*GPU_KV_SEQ
+                       + 3*SHARED_INTERMEDIATE + HIDDEN_DIM + 10 + 1) * sizeof(float);
+    }
+
+    ctx->multi_slot_initialized = 1;
+    printf("[metal] Multi-slot buffers allocated: %d slots, %.1f MB total\n",
+           MAX_MULTI_T, (double)total_alloc / 1e6);
+    #undef NEWBUF
 }
 
 // Reset delta-net and conv GPU state buffers (call at start of new generation)
