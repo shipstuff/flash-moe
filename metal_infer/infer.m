@@ -8582,6 +8582,457 @@ static int run_batched_attn_test(MetalCtx *ctx, uint32_t T, uint32_t kv_len) {
     return passed ? 0 : 1;
 }
 
+// ============================================================================
+// Phase 0: multi-slot full-attention benchmark
+//
+// Answers the "compute-bound vs latency-bound" question for flash_moe that
+// blocks Approach A (multi-buffered deferred state). See
+// docs/2026-04-11-optimization-roadmap.md Part 4 for the motivation.
+//
+// Strategy: allocate T separate command queues + per-slot scratch buffers
+// matching what a full-attention CMD1+CMD2 pass needs, then measure:
+//   (A) Serial: T iterations of the same slot's CMD1+CMD2 back-to-back on one queue
+//   (B) Parallel: T concurrent command buffers dispatched to T different queues
+// Speedup = T_serial_per_op / T_parallel_per_op.
+//   >= T/2  → GPU has headroom, Approach A is viable
+//   ~= 1    → GPU is compute-bound, Approach A is dead
+//
+// This does NOT modify fused_layer_forward. It replicates the CMD1+CMD2
+// encoder sequence (Q/K/V projections + attention + o_proj + residual + norm
+// + routing + shared expert prep) into a standalone encoding helper that
+// reads/writes only per-slot buffers and shared read-only weights/KV.
+//
+// The KV cache buffer is shared across slots (read-only during attention) —
+// all slots read the same cache content. This is fine for measuring kernel
+// throughput; the real Approach A would give each slot its own KV positions.
+// ============================================================================
+
+typedef struct {
+    id<MTLBuffer> buf_input;        // [HIDDEN_DIM]
+    id<MTLBuffer> buf_output;       // [HIDDEN_DIM]
+    id<MTLBuffer> buf_residual;     // [HIDDEN_DIM]
+    id<MTLBuffer> buf_h_mid;        // [HIDDEN_DIM]
+    id<MTLBuffer> buf_sum_sq;       // [1]
+    id<MTLBuffer> buf_attn_q;       // [NUM_ATTN_HEADS * HEAD_DIM]
+    id<MTLBuffer> buf_attn_gate;    // [NUM_ATTN_HEADS * HEAD_DIM]
+    id<MTLBuffer> buf_attn_out;     // [NUM_ATTN_HEADS * HEAD_DIM]
+    id<MTLBuffer> buf_attn_scores;  // [NUM_ATTN_HEADS * GPU_KV_SEQ]
+    id<MTLBuffer> batch_out[4];     // 0=Q, 1=K, 2=V, 3=routing gate_scores
+    id<MTLBuffer> buf_shared_gate;  // [SHARED_INTERMEDIATE]
+    id<MTLBuffer> buf_shared_up;    // [SHARED_INTERMEDIATE]
+    id<MTLBuffer> buf_shared_egate; // [1] shared_expert_gate
+} SlotFullAttnBufs;
+
+static SlotFullAttnBufs alloc_slot_full_attn_bufs(id<MTLDevice> dev) {
+    SlotFullAttnBufs s;
+    int q_dim = NUM_ATTN_HEADS * HEAD_DIM;
+    int q_proj_dim = q_dim * 2;
+    int kv_dim = NUM_KV_HEADS * HEAD_DIM;
+    #define NEWBUF(len) [dev newBufferWithLength:(size_t)(len) options:MTLResourceStorageModeShared]
+    s.buf_input       = NEWBUF(HIDDEN_DIM * sizeof(float));
+    s.buf_output      = NEWBUF(HIDDEN_DIM * sizeof(float));
+    s.buf_residual    = NEWBUF(HIDDEN_DIM * sizeof(float));
+    s.buf_h_mid       = NEWBUF(HIDDEN_DIM * sizeof(float));
+    s.buf_sum_sq      = NEWBUF(sizeof(float));
+    s.buf_attn_q      = NEWBUF(q_dim * sizeof(float));
+    s.buf_attn_gate   = NEWBUF(q_dim * sizeof(float));
+    s.buf_attn_out    = NEWBUF(q_dim * sizeof(float));
+    s.buf_attn_scores = NEWBUF((size_t)NUM_ATTN_HEADS * GPU_KV_SEQ * sizeof(float));
+    s.batch_out[0]    = NEWBUF(q_proj_dim * sizeof(float));
+    s.batch_out[1]    = NEWBUF(kv_dim * sizeof(float));
+    s.batch_out[2]    = NEWBUF(kv_dim * sizeof(float));
+    s.batch_out[3]    = NEWBUF(NUM_EXPERTS * sizeof(float));
+    s.buf_shared_gate = NEWBUF(SHARED_INTERMEDIATE * sizeof(float));
+    s.buf_shared_up   = NEWBUF(SHARED_INTERMEDIATE * sizeof(float));
+    s.buf_shared_egate= NEWBUF(sizeof(float));
+    #undef NEWBUF
+    return s;
+}
+
+// Encode one slot's full-attention CMD1+CMD2 work onto a command buffer.
+// Matches fused_layer_forward's full-attention path (minus the CPU work
+// between CMD1 and CMD2, and minus the deferred CMD3 expert dispatch).
+//
+// All buffer reads/writes are slot-local EXCEPT wf_buf (shared read-only
+// weights) and buf_kv_k[fa_idx] / buf_kv_v[fa_idx] (shared read-only KV
+// cache for the benchmark).
+static void encode_slot_full_attn(
+    id<MTLCommandBuffer> cmd,
+    SlotFullAttnBufs *s,
+    LayerWeightCache *lc,
+    int fa_idx,
+    int kv_len
+) {
+    MetalCtx *ctx = g_metal;
+    uint32_t q_proj_dim = NUM_ATTN_HEADS * HEAD_DIM * 2;
+    uint32_t kv_dim = NUM_KV_HEADS * HEAD_DIM;
+    uint32_t q_dim = NUM_ATTN_HEADS * HEAD_DIM;
+
+    // Inline helper: encode matvec reading from in_buf, writing to out_buf.
+    // Equivalent to gpu_encode_batch_matvec but per-slot I/O.
+    #define ENC_MATVEC(W, S_, B, OUT_BUF, OUT_DIM, IN_BUF) do { \
+        NSUInteger w_off = (NSUInteger)((const char *)(W)  - (const char *)[ctx->wf_buf contents]); \
+        NSUInteger s_off = (NSUInteger)((const char *)(S_) - (const char *)[ctx->wf_buf contents]); \
+        NSUInteger b_off = (NSUInteger)((const char *)(B)  - (const char *)[ctx->wf_buf contents]); \
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder]; \
+        int use_v3 = (HIDDEN_DIM <= 4096); \
+        [enc setComputePipelineState:(use_v3 ? ctx->matvec_v3 : ctx->matvec_fast)]; \
+        [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0]; \
+        [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1]; \
+        [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2]; \
+        [enc setBuffer:(IN_BUF)    offset:0     atIndex:3]; \
+        [enc setBuffer:(OUT_BUF)   offset:0     atIndex:4]; \
+        uint32_t _od = (OUT_DIM); \
+        uint32_t _id = HIDDEN_DIM; \
+        uint32_t _gs = GROUP_SIZE; \
+        [enc setBytes:&_od length:4 atIndex:5]; \
+        [enc setBytes:&_id length:4 atIndex:6]; \
+        [enc setBytes:&_gs length:4 atIndex:7]; \
+        if (use_v3) { \
+            uint32_t ntg = (_od + 7) / 8; \
+            [enc dispatchThreadgroups:MTLSizeMake(ntg, 1, 1) \
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)]; \
+        } else { \
+            [enc dispatchThreadgroups:MTLSizeMake(_od, 1, 1) \
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)]; \
+        } \
+        [enc endEncoding]; \
+    } while (0)
+
+    // ---- CMD1-equivalent: Q/K/V projections ----
+    ENC_MATVEC(lc->q_w, lc->q_s, lc->q_b, s->batch_out[0], q_proj_dim, s->buf_input);
+    ENC_MATVEC(lc->k_w, lc->k_s, lc->k_b, s->batch_out[1], kv_dim,     s->buf_input);
+    ENC_MATVEC(lc->v_w, lc->v_s, lc->v_b, s->batch_out[2], kv_dim,     s->buf_input);
+
+    // ---- CMD2-equivalent: attention + post-attention ----
+    uint32_t hd = HEAD_DIM;
+    uint32_t kvd = kv_dim;
+    uint32_t sl = (uint32_t)kv_len;
+    uint32_t seq_stride = GPU_KV_SEQ;
+    uint32_t hpkv = NUM_ATTN_HEADS / NUM_KV_HEADS;
+    float scale = 1.0f / sqrtf((float)HEAD_DIM);
+
+    // Enc A1: attn_scores_batched (Q dot K → attn_scores)
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->attn_scores_pipe];
+        [enc setBuffer:s->buf_attn_q          offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_kv_k[fa_idx]  offset:0 atIndex:1];  // shared read-only
+        [enc setBuffer:s->buf_attn_scores     offset:0 atIndex:2];
+        [enc setBytes:&hd         length:4 atIndex:3];
+        [enc setBytes:&kvd        length:4 atIndex:4];
+        [enc setBytes:&sl         length:4 atIndex:5];
+        [enc setBytes:&seq_stride length:4 atIndex:6];
+        [enc setBytes:&scale      length:4 atIndex:7];
+        [enc setBytes:&hpkv       length:4 atIndex:8];
+        [enc setBytes:&sl         length:4 atIndex:9];
+        uint32_t total_tgs = sl * NUM_ATTN_HEADS;
+        [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc A2: attn_softmax_batched
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->attn_softmax_pipe];
+        [enc setBuffer:s->buf_attn_scores offset:0 atIndex:0];
+        [enc setBytes:&sl         length:4 atIndex:1];
+        [enc setBytes:&seq_stride length:4 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(NUM_ATTN_HEADS, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc A3: attn_values_batched
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->attn_values_pipe];
+        [enc setBuffer:s->buf_attn_scores     offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_kv_v[fa_idx]  offset:0 atIndex:1];  // shared read-only
+        [enc setBuffer:s->buf_attn_out        offset:0 atIndex:2];
+        [enc setBytes:&hd         length:4 atIndex:3];
+        [enc setBytes:&kvd        length:4 atIndex:4];
+        [enc setBytes:&sl         length:4 atIndex:5];
+        [enc setBytes:&seq_stride length:4 atIndex:6];
+        [enc setBytes:&hpkv       length:4 atIndex:7];
+        uint32_t total_threads = HEAD_DIM * NUM_ATTN_HEADS;
+        uint32_t tgs = (total_threads + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc A4: sigmoid_gate (gate attn_out in-place)
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->sigmoid_gate_pipe];
+        [enc setBuffer:s->buf_attn_out  offset:0 atIndex:0];
+        [enc setBuffer:s->buf_attn_gate offset:0 atIndex:1];
+        uint32_t qdim = q_dim;
+        [enc setBytes:&qdim length:4 atIndex:2];
+        uint32_t tgs = (qdim + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc 1: o_proj matvec (buf_attn_out → buf_output)
+    {
+        NSUInteger w_off = (NSUInteger)((const char *)lc->o_w - (const char *)[ctx->wf_buf contents]);
+        NSUInteger s_off = (NSUInteger)((const char *)lc->o_s - (const char *)[ctx->wf_buf contents]);
+        NSUInteger b_off = (NSUInteger)((const char *)lc->o_b - (const char *)[ctx->wf_buf contents]);
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        uint32_t o_out = HIDDEN_DIM;
+        uint32_t o_in = q_dim;
+        uint32_t o_gs = GROUP_SIZE;
+        [enc setComputePipelineState:ctx->matvec_fast];
+        [enc setBuffer:ctx->wf_buf     offset:w_off atIndex:0];
+        [enc setBuffer:ctx->wf_buf     offset:s_off atIndex:1];
+        [enc setBuffer:ctx->wf_buf     offset:b_off atIndex:2];
+        [enc setBuffer:s->buf_attn_out offset:0     atIndex:3];
+        [enc setBuffer:s->buf_output   offset:0     atIndex:4];
+        [enc setBytes:&o_out length:4 atIndex:5];
+        [enc setBytes:&o_in  length:4 atIndex:6];
+        [enc setBytes:&o_gs  length:4 atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake(o_out, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc 2: residual_add (buf_output + buf_residual → buf_h_mid)
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        uint32_t dim = HIDDEN_DIM;
+        [enc setComputePipelineState:ctx->residual_add];
+        [enc setBuffer:s->buf_residual offset:0 atIndex:0];
+        [enc setBuffer:s->buf_output   offset:0 atIndex:1];
+        [enc setBuffer:s->buf_h_mid    offset:0 atIndex:2];
+        [enc setBytes:&dim length:4 atIndex:3];
+        uint32_t tgs = (dim + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc 3: rms_norm_sum_sq (buf_h_mid → buf_sum_sq)
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        uint32_t dim = HIDDEN_DIM;
+        [enc setComputePipelineState:ctx->rms_norm_sum];
+        [enc setBuffer:s->buf_h_mid  offset:0 atIndex:0];
+        [enc setBuffer:s->buf_sum_sq offset:0 atIndex:1];
+        [enc setBytes:&dim length:4 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc 4: rms_norm_apply_bf16 (buf_h_mid + post_attn_norm_w → buf_input)
+    {
+        NSUInteger norm_off = (NSUInteger)((const char *)lc->post_attn_norm_w - (const char *)[ctx->wf_buf contents]);
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        uint32_t dim = HIDDEN_DIM;
+        float eps = RMS_NORM_EPS;
+        [enc setComputePipelineState:ctx->rms_norm_apply_bf16];
+        [enc setBuffer:s->buf_h_mid  offset:0        atIndex:0];
+        [enc setBuffer:ctx->wf_buf   offset:norm_off atIndex:1];
+        [enc setBuffer:s->buf_sum_sq offset:0        atIndex:2];
+        [enc setBuffer:s->buf_input  offset:0        atIndex:3];
+        [enc setBytes:&dim length:4 atIndex:4];
+        [enc setBytes:&eps length:4 atIndex:5];
+        uint32_t tgs = (dim + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc 5-8: routing_proj + shared expert gate/up/shared_gate projections
+    ENC_MATVEC(lc->gate_w, lc->gate_s, lc->gate_b, s->batch_out[3],      NUM_EXPERTS,         s->buf_input);
+    ENC_MATVEC(lc->sg_w,   lc->sg_s,   lc->sg_b,   s->buf_shared_gate,   SHARED_INTERMEDIATE, s->buf_input);
+    ENC_MATVEC(lc->su_w,   lc->su_s,   lc->su_b,   s->buf_shared_up,     SHARED_INTERMEDIATE, s->buf_input);
+    ENC_MATVEC(lc->seg_w,  lc->seg_s,  lc->seg_b,  s->buf_shared_egate,  1,                   s->buf_input);
+
+    #undef ENC_MATVEC
+}
+
+// Main Phase 0 test driver. Allocates T queues + per-slot buffers, runs
+// warmup, then benchmarks serial vs parallel execution and reports the
+// speedup with a decision verdict.
+static int test_multi_slot_full_attn(WeightFile *wf, const char *arg) {
+    int T = 4, kv_len = 256, iters = 50, layer_idx = 3;
+    int parsed = sscanf(arg, "%d,%d,%d,%d", &T, &kv_len, &iters, &layer_idx);
+    if (parsed < 3) {
+        fprintf(stderr, "usage: --test-multi-slot-attn T,kv_len,iters[,layer_idx]\n");
+        fprintf(stderr, "       e.g. 4,256,50 or 4,256,50,3\n");
+        return 1;
+    }
+    if (T < 1 || T > 8) { fprintf(stderr, "T must be in [1,8]\n"); return 1; }
+    if (kv_len < 1 || (uint32_t)kv_len >= GPU_KV_SEQ) {
+        fprintf(stderr, "kv_len must be in [1,%u)\n", GPU_KV_SEQ);
+        return 1;
+    }
+    if (iters < 1) iters = 1;
+    if (layer_idx < 0 || layer_idx >= NUM_LAYERS) {
+        fprintf(stderr, "layer_idx out of range\n");
+        return 1;
+    }
+    int fa_idx = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1;
+    if ((layer_idx + 1) % FULL_ATTN_INTERVAL != 0 ||
+        fa_idx < 0 || fa_idx >= NUM_FULL_ATTN_LAYERS) {
+        fprintf(stderr, "layer %d is not a full-attention layer\n", layer_idx);
+        fprintf(stderr, "   (full-attn layers are 3, 7, 11, ..., 59)\n");
+        return 1;
+    }
+    if (!g_metal || !g_metal->device || !g_metal->attn_scores_pipe) {
+        fprintf(stderr, "Metal not fully initialized\n");
+        return 1;
+    }
+
+    printf("=== Phase 0: multi-slot full-attention benchmark ===\n");
+    printf("Layer %d (fa_idx %d), kv_len=%d, iters=%d, T=%d\n",
+           layer_idx, fa_idx, kv_len, iters, T);
+    printf("Model dims: HIDDEN=%d NUM_ATTN_HEADS=%d NUM_KV_HEADS=%d HEAD_DIM=%d\n\n",
+           HIDDEN_DIM, NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM);
+
+    // Build layer cache (normally done lazily by fused_layer_forward)
+    init_layer_scratch();
+    build_layer_cache(wf);
+    LayerWeightCache *lc = &layer_cache[layer_idx];
+    if (!lc->q_w || !lc->k_w || !lc->v_w || !lc->o_w ||
+        !lc->post_attn_norm_w || !lc->gate_w ||
+        !lc->sg_w || !lc->su_w || !lc->seg_w) {
+        fprintf(stderr, "layer %d weight pointers missing (is this really a full-attn layer?)\n", layer_idx);
+        return 1;
+    }
+
+    // Allocate T queues and per-slot buffer sets
+    id<MTLCommandQueue> queues[8] = {0};
+    SlotFullAttnBufs slots[8];
+    for (int t = 0; t < T; t++) {
+        queues[t] = [g_metal->device newCommandQueue];
+        if (!queues[t]) {
+            fprintf(stderr, "failed to create command queue %d\n", t);
+            return 1;
+        }
+        slots[t] = alloc_slot_full_attn_bufs(g_metal->device);
+    }
+
+    // Initialize inputs with small random data (avoid NaN/Inf on the attention path)
+    srand(42);
+    int q_dim = NUM_ATTN_HEADS * HEAD_DIM;
+    for (int t = 0; t < T; t++) {
+        float *in = (float *)[slots[t].buf_input contents];
+        for (int i = 0; i < HIDDEN_DIM; i++)
+            in[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
+        float *res = (float *)[slots[t].buf_residual contents];
+        for (int i = 0; i < HIDDEN_DIM; i++)
+            res[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
+        float *qbuf = (float *)[slots[t].buf_attn_q contents];
+        for (int i = 0; i < q_dim; i++)
+            qbuf[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
+        float *gate = (float *)[slots[t].buf_attn_gate contents];
+        for (int i = 0; i < q_dim; i++)
+            gate[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
+    }
+
+    // Populate shared KV cache with random data for kv_len positions
+    {
+        int kv_dim_i = NUM_KV_HEADS * HEAD_DIM;
+        float *kbuf = (float *)[g_metal->buf_kv_k[fa_idx] contents];
+        float *vbuf = (float *)[g_metal->buf_kv_v[fa_idx] contents];
+        for (int p = 0; p < kv_len; p++) {
+            for (int d = 0; d < kv_dim_i; d++) {
+                kbuf[p * kv_dim_i + d] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
+                vbuf[p * kv_dim_i + d] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
+            }
+        }
+    }
+
+    // Warmup — 5 iterations on queue[0] to ensure pipelines are compiled
+    // and the Metal scheduler has cached whatever state it needs.
+    for (int w = 0; w < 5; w++) {
+        id<MTLCommandBuffer> cmd = [queues[0] commandBuffer];
+        encode_slot_full_attn(cmd, &slots[0], lc, fa_idx, kv_len);
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+
+    // ---- Test A: serial — T iters of slot 0 on queue 0, back-to-back ----
+    double t_serial_us;
+    {
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        for (int i = 0; i < iters; i++) {
+            for (int t = 0; t < T; t++) {
+                id<MTLCommandBuffer> cmd = [queues[0] commandBuffer];
+                encode_slot_full_attn(cmd, &slots[0], lc, fa_idx, kv_len);
+                [cmd commit];
+                [cmd waitUntilCompleted];
+            }
+        }
+        t_serial_us = (CFAbsoluteTimeGetCurrent() - t0) * 1e6;
+    }
+    double serial_per_op_us = t_serial_us / (iters * T);
+
+    // ---- Test B: parallel — T slots dispatched to T queues per iter ----
+    // Each iter: enqueue T command buffers (one per slot on its own queue),
+    // then wait for all of them. Measures wall-clock time for T concurrent
+    // CMD1+CMD2 workloads.
+    double t_parallel_us;
+    {
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        for (int i = 0; i < iters; i++) {
+            id<MTLCommandBuffer> cmds[8];
+            for (int t = 0; t < T; t++) {
+                cmds[t] = [queues[t] commandBuffer];
+                encode_slot_full_attn(cmds[t], &slots[t], lc, fa_idx, kv_len);
+                [cmds[t] commit];
+            }
+            for (int t = 0; t < T; t++) {
+                [cmds[t] waitUntilCompleted];
+            }
+        }
+        t_parallel_us = (CFAbsoluteTimeGetCurrent() - t0) * 1e6;
+    }
+    double parallel_per_op_us = t_parallel_us / (iters * T);
+    double parallel_per_batch_us = t_parallel_us / iters;
+
+    double speedup = serial_per_op_us / parallel_per_op_us;
+    double throughput_ratio = (double)T / (parallel_per_batch_us / serial_per_op_us);
+
+    printf("=== Results ===\n");
+    printf("  Serial (T=%d back-to-back on 1 queue):\n", T);
+    printf("    per-op:    %7.3f ms\n", serial_per_op_us / 1000.0);
+    printf("    total:     %7.3f ms  (%d iters x T=%d ops)\n",
+           t_serial_us / 1000.0, iters, T);
+    printf("  Parallel (T=%d queues, T cmd bufs per iter):\n", T);
+    printf("    per-op:    %7.3f ms\n", parallel_per_op_us / 1000.0);
+    printf("    per-batch: %7.3f ms  (wall time for T concurrent bufs)\n",
+           parallel_per_batch_us / 1000.0);
+    printf("    total:     %7.3f ms  (%d iters)\n",
+           t_parallel_us / 1000.0, iters);
+    printf("\n");
+    printf("=== Decision gate ===\n");
+    printf("  Speedup per op (serial / parallel): %.2fx   (ideal T=%d, dead 1)\n",
+           speedup, T);
+    printf("  Throughput ratio (ops/sec parallel vs serial): %.2fx\n", throughput_ratio);
+    printf("\n");
+    if (speedup >= (T * 0.75)) {
+        printf("  VERDICT: STRONG headroom (%.2fx at T=%d).\n", speedup, T);
+        printf("           GPU is latency-bound; Approach A is HIGHLY VIABLE.\n");
+        printf("           Commit to Phase 1 full multi-buffer refactor.\n");
+    } else if (speedup >= (T * 0.5)) {
+        printf("  VERDICT: MODERATE headroom (%.2fx at T=%d).\n", speedup, T);
+        printf("           GPU has real parallel capacity; Approach A is VIABLE.\n");
+        printf("           Expected win ~30-60%% wall-clock for full prefill.\n");
+    } else if (speedup >= 1.3) {
+        printf("  VERDICT: WEAK headroom (%.2fx at T=%d).\n", speedup, T);
+        printf("           Partial parallelism; Approach A gives limited wins.\n");
+        printf("           Consider before committing to 1500-2000 LOC refactor.\n");
+    } else {
+        printf("  VERDICT: NO headroom (%.2fx at T=%d).\n", speedup, T);
+        printf("           GPU is compute-bound for this workload.\n");
+        printf("           Approach A is NOT viable. Pivot to constant-factor wins:\n");
+        printf("             - Kernel fusion (#2 in roadmap)\n");
+        printf("             - Expert clustering (#3 in roadmap)\n");
+        printf("             - Attention kernel tiling (#4 in roadmap)\n");
+    }
+
+    return 0;
+}
+
 // Run a sweep of (T, kv_len) pairs as specified by the comma-separated arg.
 // Format: "T,kv_len" — tests just that single pair.
 // Call multiple times for a full sweep.
@@ -8653,6 +9104,7 @@ int main(int argc, char **argv) {
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
         const char *test_batch_matmul_arg = NULL;  // --test-batch-matmul T,out_dim,in_dim
         const char *batch_attn_arg = NULL;  // --test-batch-attn T,kv_len
+        const char *multi_slot_attn_arg = NULL;  // --test-multi-slot-attn T,kv_len,iters[,layer_idx]
 
         const char *sparse_moe_arg = NULL;  // --test-sparse-moe T,overlap
         int batch_prefill_T = 1;  // --batch-prefill T : group T prompt tokens per fused_layer_forward_batch call
@@ -8681,6 +9133,7 @@ int main(int argc, char **argv) {
             {"test-batch-matmul", required_argument, 0, 'X'},
             {"test-batch-attn",   required_argument, 0, 'A'},
             {"test-sparse-moe",   required_argument, 0, 'Y'},
+            {"test-multi-slot-attn", required_argument, 0, 1001},  // no short form
             {"batch-prefill",     required_argument, 0, 'Q'},
             {"help",              no_argument,       0, 'h'},
             {0, 0, 0, 0}
@@ -8720,6 +9173,7 @@ int main(int argc, char **argv) {
                 case 'R': serve_port = atoi(optarg); break;
                 case 'X': test_batch_matmul_arg = optarg; break;
                 case 'Y': sparse_moe_arg = optarg; break;
+                case 1001: multi_slot_attn_arg = optarg; break;
                 case 'Q':
                     batch_prefill_T = atoi(optarg);
                     if (batch_prefill_T < 1) batch_prefill_T = 1;
@@ -8859,6 +9313,14 @@ int main(int argc, char **argv) {
         // Wrap weight file for Metal GPU access
         if (g_metal) {
             metal_set_weights(g_metal, wf->data, wf->size);
+        }
+
+        // ---- Phase 0 multi-slot full-attention benchmark (--test-multi-slot-attn) ----
+        // Runs after wf + metal_set_weights but BEFORE vocab/prompt loading or
+        // expert file mmap, since the test only needs weights and layer cache.
+        if (multi_slot_attn_arg) {
+            int ret = test_multi_slot_full_attn(wf, multi_slot_attn_arg);
+            return ret;
         }
 
         // ---- Load vocabulary ----
