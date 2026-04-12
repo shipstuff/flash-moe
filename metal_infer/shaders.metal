@@ -1616,6 +1616,153 @@ kernel void tq_fused_attention(
 
 
 // ============================================================================
+// Fused flash-attention for non-TQ path with fp16 KV cache
+// ============================================================================
+//
+// Replaces the 3-kernel attention pipeline (attn_scores + attn_softmax +
+// attn_values) with a single fused kernel using online softmax. Eliminates
+// the intermediate scores buffer (25 MB at 200k context).
+//
+// KV cache stored as float16 → halves bandwidth vs float32.
+// Online softmax avoids materializing the full attention matrix.
+// Sigmoid gate is fused into the output write (unlike TQ which uses separate kernel).
+//
+// Algorithm: same as tq_fused_attention but reads fp16 K/V directly (no
+// 2-bit dequant, no norms, no inverse rotation).
+//
+// Grid: (NUM_ATTN_HEADS, 1, 1) — one threadgroup per head
+// Threads: 256 (8 simdgroups × 32 lanes)
+//
+// Threadgroup memory: 8×256×4 + 2×8×4 + 2×4 = 8328 bytes
+// ============================================================================
+kernel void fused_flash_attention_fp16(
+    device const float*  Q         [[buffer(0)]],   // [NUM_ATTN_HEADS, HEAD_DIM]
+    device const float*  Q_gate    [[buffer(1)]],   // [NUM_ATTN_HEADS, HEAD_DIM]
+    device const half*   K_cache   [[buffer(2)]],   // [max_seq, kv_dim] fp16
+    device const half*   V_cache   [[buffer(3)]],   // [max_seq, kv_dim] fp16
+    device       float*  attn_out  [[buffer(4)]],   // [NUM_ATTN_HEADS, HEAD_DIM]
+    constant     uint&   seq_len   [[buffer(5)]],   // current KV cache length
+    constant     uint&   kv_dim    [[buffer(6)]],   // NUM_KV_HEADS * HEAD_DIM = 512
+    constant     uint&   heads_per_kv [[buffer(7)]], // 16 (GQA ratio)
+    uint tgid [[threadgroup_position_in_grid]],      // head index
+    uint lid  [[thread_position_in_threadgroup]],
+    uint sid  [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint head = tgid;
+    const uint kv_head = head / heads_per_kv;
+    const uint num_sg = 8;
+    const float scale = rsqrt((float)HEAD_DIM);
+
+    // Per-lane query values (8 dims per lane, 32 lanes × 8 = 256 dims)
+    float q_local[LANES_PER_SIMD];
+    float gate_local[LANES_PER_SIMD];
+    for (int i = 0; i < LANES_PER_SIMD; i++) {
+        uint d = lane + i * SIMD_SIZE;
+        q_local[i] = (d < (uint)HEAD_DIM) ? Q[head * HEAD_DIM + d] : 0.0f;
+        gate_local[i] = (d < (uint)HEAD_DIM) ? Q_gate[head * HEAD_DIM + d] : 0.0f;
+    }
+
+    // Online softmax accumulators (per simdgroup)
+    float local_acc[LANES_PER_SIMD];
+    for (int i = 0; i < LANES_PER_SIMD; i++) local_acc[i] = 0.0f;
+    float local_max = -1e10f;
+    float local_sum = 0.0f;
+
+    // ---- Phase 1: Q·K scoring + online softmax + V accumulation ----
+    // Each simdgroup processes every num_sg-th key position
+    for (uint p = sid; p < seq_len; p += num_sg) {
+        // Compute Q·K dot product across all 256 dimensions
+        float partial_dot = 0.0f;
+        for (int i = 0; i < LANES_PER_SIMD; i++) {
+            uint d = lane + i * SIMD_SIZE;
+            if (d < (uint)HEAD_DIM) {
+                float k_val = (float)K_cache[p * kv_dim + kv_head * HEAD_DIM + d];
+                partial_dot += q_local[i] * k_val;
+            }
+        }
+        float dot = simd_sum(partial_dot);
+        float score = dot * scale;
+
+        // Online softmax update
+        float new_max = max(local_max, score);
+        float exp_old = metal::fast::exp(local_max - new_max);
+        float exp_new = metal::fast::exp(score - new_max);
+
+        // Accumulate weighted V values
+        for (int i = 0; i < LANES_PER_SIMD; i++) {
+            uint d = lane + i * SIMD_SIZE;
+            if (d < (uint)HEAD_DIM) {
+                float v_val = (float)V_cache[p * kv_dim + kv_head * HEAD_DIM + d];
+                local_acc[i] = local_acc[i] * exp_old + exp_new * v_val;
+            }
+        }
+        local_max = new_max;
+        local_sum = local_sum * exp_old + exp_new;
+    }
+
+    // ---- Phase 2: Write per-simdgroup results to threadgroup memory ----
+    threadgroup float tg_max[8];
+    threadgroup float tg_sum[8];
+    threadgroup float tg_acc[8 * HEAD_DIM];
+
+    if (lane == 0) {
+        tg_max[sid] = local_max;
+        tg_sum[sid] = local_sum;
+    }
+    for (int i = 0; i < LANES_PER_SIMD; i++) {
+        uint d = lane + i * SIMD_SIZE;
+        if (d < (uint)HEAD_DIM) {
+            tg_acc[sid * HEAD_DIM + d] = local_acc[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Phase 3a: Compute global max and sum (thread 0 only) ----
+    threadgroup float tg_global_max;
+    threadgroup float tg_global_sum;
+    if (lid == 0) {
+        float gmax = -1e10f;
+        for (uint s = 0; s < num_sg; s++) gmax = max(gmax, tg_max[s]);
+        float gsum = 0.0f;
+        for (uint s = 0; s < num_sg; s++)
+            gsum += tg_sum[s] * metal::fast::exp(tg_max[s] - gmax);
+        tg_global_max = gmax;
+        tg_global_sum = gsum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Phase 3b: Combine simdgroup accumulators + normalize (simdgroup 0) ----
+    float global_max = tg_global_max;
+    float inv_sum = (tg_global_sum > 1e-8f) ? (1.0f / tg_global_sum) : 0.0f;
+
+    if (sid == 0) {
+        for (int i = 0; i < LANES_PER_SIMD; i++) {
+            uint d = lane + i * SIMD_SIZE;
+            if (d >= (uint)HEAD_DIM) continue;
+            float accum = 0.0f;
+            for (uint s = 0; s < num_sg; s++) {
+                float factor = metal::fast::exp(tg_max[s] - global_max);
+                accum += tg_acc[s * HEAD_DIM + d] * factor;
+            }
+            tg_acc[d] = accum * inv_sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Phase 4: Apply sigmoid gate and write output ----
+    for (int i = 0; i < LANES_PER_SIMD; i++) {
+        uint d = lane + i * SIMD_SIZE;
+        if (d < (uint)HEAD_DIM) {
+            float val = tg_acc[d];
+            float g = 1.0f / (1.0f + metal::fast::exp(-gate_local[i]));  // sigmoid
+            attn_out[head * HEAD_DIM + d] = val * g;
+        }
+    }
+}
+
+
+// ============================================================================
 // Kernel 2: tq_pack_update
 // ============================================================================
 //
@@ -2059,4 +2206,168 @@ kernel void attn_values_batched_T(
         acc += s[p] * V_cache[p * kv_dim + kv_h * head_dim + d];
     }
     out[h * Thead + t * head_dim + d] = acc;
+}
+
+// ============================================================================
+// Full-attention Q/K norm + RoPE + KV cache write — fused GPU kernel
+//
+// Replaces the CPU work between CMD1 and CMD2 for full-attention layers,
+// enabling CMD1+CMD2 fusion (one Metal command buffer per layer).
+//
+// Dispatched as (NUM_ATTN_HEADS + NUM_KV_HEADS) threadgroups × HEAD_DIM threads.
+// Threadgroups 0..NUM_ATTN_HEADS-1 process Q heads:
+//   - Split q_proj into q (first half) and gate (second half)
+//   - Per-head RMS norm on q using q_norm_w (bf16)
+//   - Partial RoPE on first rotary_dim dims
+//   - Write q → buf_attn_q, gate → buf_attn_gate
+// Threadgroups NUM_ATTN_HEADS..NUM_ATTN_HEADS+NUM_KV_HEADS-1 process K/V:
+//   - Per-head RMS norm on k using k_norm_w (bf16)
+//   - Partial RoPE on first rotary_dim dims
+//   - Write k → kv_k[cache_pos], v → kv_v[cache_pos]
+// ============================================================================
+
+// Helper: bf16 → float (same as host-side bf16_to_f32)
+static inline float metal_bf16_to_f32(ushort bf16) {
+    uint u = (uint)bf16 << 16;
+    return as_type<float>(u);
+}
+
+kernel void fullattn_norm_rope_kv(
+    device const float*  q_proj       [[buffer(0)]],   // [NUM_ATTN_HEADS * HEAD_DIM * 2]
+    device const float*  k_proj       [[buffer(1)]],   // [NUM_KV_HEADS * HEAD_DIM]
+    device const float*  v_proj       [[buffer(2)]],   // [NUM_KV_HEADS * HEAD_DIM]
+    device const ushort* q_norm_w     [[buffer(3)]],   // [HEAD_DIM] bf16
+    device const ushort* k_norm_w     [[buffer(4)]],   // [HEAD_DIM] bf16
+    device float*        attn_q       [[buffer(5)]],   // [NUM_ATTN_HEADS * HEAD_DIM] out
+    device float*        attn_gate    [[buffer(6)]],   // [NUM_ATTN_HEADS * HEAD_DIM] out
+    device float*        kv_k         [[buffer(7)]],   // KV cache K buffer float32
+    device float*        kv_v         [[buffer(8)]],   // KV cache V buffer float32
+    constant uint&       num_q_heads  [[buffer(9)]],   // NUM_ATTN_HEADS (32)
+    constant uint&       num_kv_heads [[buffer(10)]],  // NUM_KV_HEADS (2)
+    constant uint&       head_dim     [[buffer(11)]],  // HEAD_DIM (256)
+    constant uint&       rotary_dim   [[buffer(12)]],  // ROTARY_DIM (64)
+    constant float&      rope_theta   [[buffer(13)]],  // ROPE_THETA (10M)
+    constant uint&       pos          [[buffer(14)]],  // token position for RoPE
+    constant uint&       cache_pos    [[buffer(15)]],  // KV cache write position
+    constant uint&       kv_dim       [[buffer(16)]],  // NUM_KV_HEADS * HEAD_DIM (512)
+    constant float&      eps          [[buffer(17)]],  // RMS_NORM_EPS
+    device half*         kv_k_f16     [[buffer(18)]],  // fp16 KV cache K (for fused flash-attn)
+    device half*         kv_v_f16     [[buffer(19)]],  // fp16 KV cache V (for fused flash-attn)
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]]
+) {
+    uint d = lid;  // dimension index within the head
+    if (d >= head_dim) return;
+
+    uint half_rot = rotary_dim / 2;
+
+    if (tgid < num_q_heads) {
+        // ---- Q head processing ----
+        uint h = tgid;
+
+        // Split q_proj: q = first HEAD_DIM, gate = second HEAD_DIM (interleaved)
+        float q_val = q_proj[h * head_dim * 2 + d];
+        float gate_val = q_proj[h * head_dim * 2 + head_dim + d];
+
+        // Per-head RMS norm on q
+        // Use threadgroup reduction for sum_sq
+        threadgroup float shared_sum[256];
+        shared_sum[lid] = q_val * q_val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Parallel reduction
+        for (uint s = head_dim / 2; s > 0; s >>= 1) {
+            if (lid < s && lid + s < head_dim)
+                shared_sum[lid] += shared_sum[lid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float sum_sq = shared_sum[0];
+        float inv_rms = rsqrt(sum_sq / (float)head_dim + eps);
+        q_val = q_val * inv_rms * metal_bf16_to_f32(q_norm_w[d]);
+
+        // Partial RoPE on first rotary_dim dims
+        if (d < half_rot) {
+            // Read the paired dimension
+            float q_pair = q_proj[h * head_dim * 2 + d + half_rot];
+            float q_pair_normed = q_pair;
+            // Need to norm the pair too (it was already normed above if d < half_rot)
+            // Actually: the norm was applied to ALL dims, then RoPE to first rotary_dim.
+            // So q_val is already normed. We need the normed value of q[d + half_rot].
+            // Recompute: q_pair was already read but we need its normed version.
+            // This requires shared memory... let me use a simpler approach.
+            // Actually: after norm, we apply RoPE. So we need to store the normed values
+            // first, then apply RoPE in a second pass.
+
+            // For now: write normed q to shared, barrier, then apply RoPE
+        }
+
+        // SIMPLER APPROACH: write normed q to output, barrier, then apply RoPE in-place
+        attn_q[h * head_dim + d] = q_val;
+        attn_gate[h * head_dim + d] = gate_val;
+        threadgroup_barrier(mem_flags::mem_device);
+
+        // RoPE on first rotary_dim dims (pairs are d and d+half_rot, MLX convention)
+        if (d < half_rot) {
+            float freq = 1.0f / pow(rope_theta, (float)(2 * d) / (float)rotary_dim);
+            float angle = (float)pos * freq;
+            float cos_a = cos(angle);
+            float sin_a = sin(angle);
+
+            float q0 = attn_q[h * head_dim + d];
+            float q1 = attn_q[h * head_dim + d + half_rot];
+            attn_q[h * head_dim + d]            = q0 * cos_a - q1 * sin_a;
+            attn_q[h * head_dim + d + half_rot] = q0 * sin_a + q1 * cos_a;
+        }
+
+    } else {
+        // ---- K/V head processing ----
+        uint h = tgid - num_q_heads;
+        if (h >= num_kv_heads) return;
+
+        float k_val = k_proj[h * head_dim + d];
+
+        // Per-head K RMS norm
+        threadgroup float shared_sum[256];
+        shared_sum[lid] = k_val * k_val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint s = head_dim / 2; s > 0; s >>= 1) {
+            if (lid < s && lid + s < head_dim)
+                shared_sum[lid] += shared_sum[lid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float sum_sq = shared_sum[0];
+        float inv_rms = rsqrt(sum_sq / (float)head_dim + eps);
+        k_val = k_val * inv_rms * metal_bf16_to_f32(k_norm_w[d]);
+
+        // Write normed K to KV cache, then apply RoPE in-place
+        kv_k[cache_pos * kv_dim + h * head_dim + d] = k_val;
+        threadgroup_barrier(mem_flags::mem_device);
+
+        // Partial RoPE on K
+        if (d < half_rot) {
+            float freq = 1.0f / pow(rope_theta, (float)(2 * d) / (float)rotary_dim);
+            float angle = (float)pos * freq;
+            float cos_a = cos(angle);
+            float sin_a = sin(angle);
+
+            uint base = cache_pos * kv_dim + h * head_dim;
+            float k0 = kv_k[base + d];
+            float k1 = kv_k[base + d + half_rot];
+            kv_k[base + d]            = k0 * cos_a - k1 * sin_a;
+            kv_k[base + d + half_rot] = k0 * sin_a + k1 * cos_a;
+        }
+
+        // Copy V to KV cache (no modification)
+        float v_val = v_proj[h * head_dim + d];
+        kv_v[cache_pos * kv_dim + h * head_dim + d] = v_val;
+
+        // Write fp16 KV cache (for fused flash-attention)
+        threadgroup_barrier(mem_flags::mem_device);  // ensure RoPE writes are visible
+        uint f16_off = cache_pos * kv_dim + h * head_dim + d;
+        kv_k_f16[f16_off] = (half)kv_k[f16_off];
+        kv_v_f16[f16_off] = (half)v_val;
+    }
 }
