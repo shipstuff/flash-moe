@@ -9060,13 +9060,16 @@ static void encode_slot_cmd2_attn_post(
 // buf_input_slot[t] contains h_post (post-attn-normed, for expert routing).
 // batch_out_slot[t][3] contains gate_scores (routing logits).
 // ============================================================================
+// prev_gpu_combined: if true, buf_input_slot[t] already has GPU-normed input
+//   from previous layer's CMD3. Skip norm + hidden copy. Finalize after CMD1 wait.
 static void multi_slot_full_attn_layer(
     WeightFile *wf,
     int layer_idx,
     float *hidden_batch,  // [T * HIDDEN_DIM] in/out
     int T,
     KVCache *kv,
-    int pos_start
+    int pos_start,
+    int prev_gpu_combined
 ) {
     init_layer_scratch();
     if (!layer_cache_built) build_layer_cache(wf);
@@ -9077,58 +9080,68 @@ static void multi_slot_full_attn_layer(
     int kv_dim = NUM_KV_HEADS * HEAD_DIM;
     int q_dim = NUM_ATTN_HEADS * HEAD_DIM;
     int kv_len_before = kv->len;
+    MetalCtx *ctx = g_metal;
 
-    // Validate: must be a full-attention layer with sufficient kv_len for GPU path
     if (fa_idx < 0 || fa_idx >= NUM_FULL_ATTN_LAYERS) return;
     if (!lc->q_w || !lc->o_w || !lc->post_attn_norm_w || !lc->gate_w) return;
 
-    // ---- Step 1+2: GPU input norm + projections in parallel ----
-    // Use GPU rms_norm_apply_bf16 (not CPU cpu_rms_norm) to match the serial
-    // fast-path's precision. CPU fp32 norm vs GPU bf16 norm causes cascading
-    // divergence through delta-net state updates → degenerate output.
+    // ---- Step 1: CMD1 dispatch (norm + projections) on per-slot queues ----
     id<MTLCommandBuffer> cmd1s[MAX_MULTI_T];
     for (int t = 0; t < T; t++) {
-        float *hidden_t = hidden_batch + (size_t)t * HIDDEN_DIM;
-        // Copy raw hidden → buf_input_slot[t] (for GPU norm in-place)
-        memcpy([g_metal->buf_input_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
-        // Save residual for CMD2's residual_add
-        memcpy([g_metal->buf_residual_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
+        cmd1s[t] = [ctx->queue_slot[t] commandBuffer];
 
-        SlotFullAttnBufs sb = get_slot_bufs_from_ctx(g_metal, t);
-        cmd1s[t] = [g_metal->queue_slot[t] commandBuffer];
+        if (!prev_gpu_combined) {
+            // No pending CMD3 — copy hidden to buf_input + GPU norm
+            float *hidden_t = hidden_batch + (size_t)t * HIDDEN_DIM;
+            memcpy([ctx->buf_input_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
+            memcpy([ctx->buf_residual_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
 
-        // GPU norm: rms_norm_sum + rms_norm_apply_bf16 (in-place on buf_input_slot[t])
-        {
-            id<MTLComputeCommandEncoder> enc = [cmd1s[t] computeCommandEncoder];
-            uint32_t dim = HIDDEN_DIM;
-            [enc setComputePipelineState:g_metal->rms_norm_sum];
-            [enc setBuffer:sb.buf_input  offset:0 atIndex:0];
-            [enc setBuffer:sb.buf_sum_sq offset:0 atIndex:1];
-            [enc setBytes:&dim length:4 atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
+            // GPU norm: rms_norm_sum + rms_norm_apply_bf16 in-place
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd1s[t] computeCommandEncoder];
+                uint32_t dim = HIDDEN_DIM;
+                [enc setComputePipelineState:ctx->rms_norm_sum];
+                [enc setBuffer:ctx->buf_input_slot[t]  offset:0 atIndex:0];
+                [enc setBuffer:ctx->buf_sum_sq_slot[t] offset:0 atIndex:1];
+                [enc setBytes:&dim length:4 atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            {
+                NSUInteger norm_off = (NSUInteger)((const char *)lc->input_norm_w - (const char *)[ctx->wf_buf contents]);
+                id<MTLComputeCommandEncoder> enc = [cmd1s[t] computeCommandEncoder];
+                uint32_t dim = HIDDEN_DIM; float eps = RMS_NORM_EPS;
+                [enc setComputePipelineState:ctx->rms_norm_apply_bf16];
+                [enc setBuffer:ctx->buf_input_slot[t]  offset:0        atIndex:0];
+                [enc setBuffer:ctx->wf_buf             offset:norm_off atIndex:1];
+                [enc setBuffer:ctx->buf_sum_sq_slot[t] offset:0        atIndex:2];
+                [enc setBuffer:ctx->buf_input_slot[t]  offset:0        atIndex:3];
+                [enc setBytes:&dim length:4 atIndex:4];
+                [enc setBytes:&eps length:4 atIndex:5];
+                [enc dispatchThreadgroups:MTLSizeMake((dim+255)/256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
         }
-        {
-            NSUInteger norm_off = (NSUInteger)((const char *)lc->input_norm_w - (const char *)[g_metal->wf_buf contents]);
-            id<MTLComputeCommandEncoder> enc = [cmd1s[t] computeCommandEncoder];
-            uint32_t dim = HIDDEN_DIM; float eps = RMS_NORM_EPS;
-            [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
-            [enc setBuffer:sb.buf_input  offset:0        atIndex:0];
-            [enc setBuffer:g_metal->wf_buf offset:norm_off atIndex:1];
-            [enc setBuffer:sb.buf_sum_sq offset:0        atIndex:2];
-            [enc setBuffer:sb.buf_input  offset:0        atIndex:3]; // in-place
-            [enc setBytes:&dim length:4 atIndex:4];
-            [enc setBytes:&eps length:4 atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake((dim+255)/256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
-        }
+        // When prev_gpu_combined: buf_input_slot[t] already GPU-normed by CMD3.
+        // CMD1 on queue_slot[t] auto-waits for CMD3 via Metal serial queue.
 
-        // Projections (read from GPU-normed buf_input_slot[t])
+        SlotFullAttnBufs sb = get_slot_bufs_from_ctx(ctx, t);
         encode_slot_cmd1_proj(cmd1s[t], &sb, lc);
         [cmd1s[t] commit];
     }
     for (int t = 0; t < T; t++) {
         [cmd1s[t] waitUntilCompleted];
+    }
+
+    // ---- Pipeline finalize: CMD3 is done (implied by CMD1 wait on same queue) ----
+    if (prev_gpu_combined) {
+        for (int t = 0; t < T; t++) {
+            if (deferred_slot_active(t)) {
+                complete_deferred_slot(t);
+            }
+            memcpy([ctx->buf_residual_slot[t] contents],
+                   hidden_batch + (size_t)t * HIDDEN_DIM, HIDDEN_DIM * sizeof(float));
+        }
     }
 
     // ---- Step 3: CPU attention work per slot (serial, ~0.08 ms × T) ----
@@ -9886,6 +9899,8 @@ static void multi_slot_prefill_chunk(
         int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
         if (ms_dbg) fprintf(stderr, "[MS] layer=%d is_full=%d T=%d\n", layer, is_full, T);
 
+        double t_layer_s = now_ms();
+
         // ---- Step 0: Record GPU-combined state from pending CMD3 (DON'T finalize) ----
         // The finalize (wait + readback) happens INSIDE the layer drivers AFTER
         // CMD1 is dispatched on queue_slot[t]. Metal's serial queue guarantees
@@ -9901,8 +9916,10 @@ static void multi_slot_prefill_chunk(
         // and finalize the previous CMD3 AFTER CMD1 wait.
         if (is_full) {
             KVCache *kv = kv_caches[layer];
-            if (kv && kv->len >= 32 && g_metal->attn_scores_pipe) {
-                multi_slot_full_attn_layer(wf, layer, hidden_chunk, T, kv, pos_start);
+            // Use multi-slot even at low kv_len — the serial fallback breaks
+            // the deferred pipeline. GPU attention works at kv_len >= 1.
+            if (kv && kv->len >= 1 && g_metal->attn_scores_pipe) {
+                multi_slot_full_attn_layer(wf, layer, hidden_chunk, T, kv, pos_start, prev_gpu);
             } else {
                 // Fallback: serial per-token
                 for (int t = 0; t < T; t++) {
@@ -9936,14 +9953,36 @@ static void multi_slot_prefill_chunk(
             }
         }
 
+        double t_attn_done = now_ms();
+
         // ---- Step 2: Expert dispatch per token — ASYNC on per-slot queues ----
-        if (ms_dbg) fprintf(stderr, "[MS] expert dispatch layer=%d\n", layer);
         for (int t = 0; t < T; t++) {
             multi_slot_expert_dispatch_token(
                 layer,
                 hidden_chunk + (size_t)t * HIDDEN_DIM,
                 t, K, layer_fds[layer],
                 layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL);
+        }
+
+        double t_expert_done = now_ms();
+        if (ms_dbg && layer < 5) {
+            fprintf(stderr, "[MS-TIME] layer=%d attn=%.2f expert=%.2f total=%.2f ms\n",
+                    layer, t_attn_done - t_layer_s, t_expert_done - t_attn_done,
+                    t_expert_done - t_layer_s);
+        }
+        static double sum_attn = 0, sum_expert = 0;
+        static int chunk_count = 0;
+        sum_attn += (t_attn_done - t_layer_s);
+        sum_expert += (t_expert_done - t_attn_done);
+        if (layer == NUM_LAYERS - 1) {
+            chunk_count++;
+            if (chunk_count <= 5) {
+                fprintf(stderr, "[MS-CHUNK] chunk=%d sum_attn=%.1f sum_expert=%.1f total=%.1f ms (%.1f ms/tok at T=%d)\n",
+                        chunk_count, sum_attn, sum_expert, sum_attn + sum_expert,
+                        (sum_attn + sum_expert) / T, T);
+            }
+            sum_attn = 0;
+            sum_expert = 0;
         }
 
         // Reset — will be set by deferred finalize at next layer's step 0
@@ -10357,7 +10396,7 @@ static int test_multi_slot_full_attn(WeightFile *wf, const char *arg) {
                     // Random hidden state per slot
                     for (int d = 0; d < HIDDEN_DIM; d++)
                         hidden_chunk[d] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
-                    multi_slot_full_attn_layer(wf, layer_idx, hidden_chunk, 1, &test_kv, kv_len + i*T + t);
+                    multi_slot_full_attn_layer(wf, layer_idx, hidden_chunk, 1, &test_kv, kv_len + i*T + t, 0);
                     test_kv.len = kv_len;  // reset after each
                 }
             }
@@ -10372,7 +10411,7 @@ static int test_multi_slot_full_attn(WeightFile *wf, const char *arg) {
                 // Random hidden states for all T slots
                 for (int d = 0; d < T * HIDDEN_DIM; d++)
                     hidden_chunk[d] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
-                multi_slot_full_attn_layer(wf, layer_idx, hidden_chunk, T, &test_kv, kv_len + i*T);
+                multi_slot_full_attn_layer(wf, layer_idx, hidden_chunk, T, &test_kv, kv_len + i*T, 0);
                 test_kv.len = kv_len;  // reset
             }
             t_real_multi_us = (CFAbsoluteTimeGetCurrent() - t0) * 1e6;
