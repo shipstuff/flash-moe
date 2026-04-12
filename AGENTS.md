@@ -92,6 +92,14 @@ not-actually-doing-I/O path with garbage expert data. See the benchmark file
 Parked investigations that have been scoped in detail but are waiting for a
 focused multi-session effort. Read these before re-opening a related topic.
 
+- **`docs/2026-04-11-optimization-roadmap.md`** — **The load-bearing doc.**
+  Full pipeline explainer (how CMD1/CMD2/CMD3 deferred state works, why the
+  current warm-cache path is fast), multi-buffered deferred state explanation,
+  full catalog of all 12+ optimization avenues considered this session with
+  honest value/probability/effort rankings, and the current decision for the
+  next working session (Multi-buffer Phase 0 measurement). Read this first
+  when re-opening any performance work — the other scoping docs are
+  supporting evidence for the decisions captured here.
 - `docs/2026-04-11-batch-prefill-scoping.md` — the batch prefill refactor
   investigation. Current native batched path is cold-cache only; warm-cache
   is regressed because the layer-outside, tokens-inside loop structure
@@ -103,9 +111,13 @@ focused multi-session effort. Read these before re-opening a related topic.
   the 45 GatedDeltaNet linear-attention layers. The parallel `anemll-qwen35`
   project on `carl@192.168.0.62` has a working Qwen3.5-9B dense ANE port at
   ~11.4 tok/s; its PyTorch reference and LUT4 converter pipeline cover both
-  layer types flash_moe uses. Gated on measuring Swift CoreML per-prediction
-  dispatch overhead in Phase 0 before committing the port. Estimated
-  9-15 focused days for Phase 0 through Phase 4.
+  layer types flash_moe uses.
+- `docs/2026-04-11-ane-phase1a-results.md` — Phase 0 + Phase 1a ANE
+  measurements. Structural viability confirmed (100% ANE placement, LUT4
+  at 1.41 ms/layer), but the layer dependency chain + MoE GPU-only constraint
+  makes ANE offload a 43% wall-clock regression for flash_moe specifically.
+  Blocked on multi-buffered deferred state landing first. Durable findings
+  (LUT4 rule, dispatch overhead, transfer cost) saved to memory.
 
 ---
 
