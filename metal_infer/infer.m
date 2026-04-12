@@ -8794,6 +8794,380 @@ typedef struct {
     id<MTLBuffer> buf_shared_egate; // [1] shared_expert_gate
 } SlotFullAttnBufs;
 
+// Build a SlotFullAttnBufs from MetalCtx's per-slot arrays.
+// This bridges Phase 0's test harness structs with Phase 1a's MetalCtx slots.
+static SlotFullAttnBufs get_slot_bufs_from_ctx(MetalCtx *ctx, int t) {
+    SlotFullAttnBufs s;
+    s.buf_input       = ctx->buf_input_slot[t];
+    s.buf_output      = ctx->buf_output_slot[t];
+    s.buf_residual    = ctx->buf_residual_slot[t];
+    s.buf_h_mid       = ctx->buf_h_mid_slot[t];
+    s.buf_sum_sq      = ctx->buf_sum_sq_slot[t];
+    s.buf_attn_q      = ctx->buf_attn_q_slot[t];
+    s.buf_attn_gate   = ctx->buf_attn_gate_slot[t];
+    s.buf_attn_out    = ctx->buf_attn_out_slot[t];
+    s.buf_attn_scores = ctx->buf_attn_scores_slot[t];
+    s.batch_out[0]    = ctx->batch_out_slot[t][0];
+    s.batch_out[1]    = ctx->batch_out_slot[t][1];
+    s.batch_out[2]    = ctx->batch_out_slot[t][2];
+    s.batch_out[3]    = ctx->batch_out_slot[t][3];
+    s.buf_shared_gate = ctx->buf_shared_gate_slot[t];
+    s.buf_shared_up   = ctx->buf_shared_up_slot[t];
+    s.buf_shared_egate= ctx->buf_shared_out_slot[t];
+    return s;
+}
+
+// ============================================================================
+// Phase 1c/1d: Multi-slot CMD1 and CMD2 split encoders + prefill driver
+//
+// CMD1 = Q/K/V projections (reading from buf_input_slot[t])
+// CMD2 = attention scores/softmax/values + sigmoid gate + o_proj +
+//        residual_add + rms_norm + routing/shared expert projections
+//
+// Between CMD1 and CMD2, the CPU does per-slot:
+//   Q/K split from q_proj, QK RMS norm, RoPE, KV cache write,
+//   copy Q → buf_attn_q_slot[t], gate → buf_attn_gate_slot[t]
+// ============================================================================
+
+// Encode CMD1: Q/K/V projections on per-slot buffers
+static void encode_slot_cmd1_proj(
+    id<MTLCommandBuffer> cmd,
+    SlotFullAttnBufs *s,
+    LayerWeightCache *lc
+) {
+    MetalCtx *ctx = g_metal;
+    uint32_t q_proj_dim = NUM_ATTN_HEADS * HEAD_DIM * 2;
+    uint32_t kv_dim = NUM_KV_HEADS * HEAD_DIM;
+
+    // Reuse the ENC_MATVEC helper (same as encode_slot_full_attn)
+    #define ENC_MV(W, S_, B, OUT_BUF, OUT_DIM, IN_BUF) do { \
+        NSUInteger w_off = (NSUInteger)((const char *)(W)  - (const char *)[ctx->wf_buf contents]); \
+        NSUInteger s_off = (NSUInteger)((const char *)(S_) - (const char *)[ctx->wf_buf contents]); \
+        NSUInteger b_off = (NSUInteger)((const char *)(B)  - (const char *)[ctx->wf_buf contents]); \
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder]; \
+        int use_v3 = (HIDDEN_DIM <= 4096); \
+        [enc setComputePipelineState:(use_v3 ? ctx->matvec_v3 : ctx->matvec_fast)]; \
+        [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0]; \
+        [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1]; \
+        [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2]; \
+        [enc setBuffer:(IN_BUF)    offset:0     atIndex:3]; \
+        [enc setBuffer:(OUT_BUF)   offset:0     atIndex:4]; \
+        uint32_t _od = (OUT_DIM); uint32_t _id = HIDDEN_DIM; uint32_t _gs = GROUP_SIZE; \
+        [enc setBytes:&_od length:4 atIndex:5]; \
+        [enc setBytes:&_id length:4 atIndex:6]; \
+        [enc setBytes:&_gs length:4 atIndex:7]; \
+        if (use_v3) { \
+            [enc dispatchThreadgroups:MTLSizeMake((_od+7)/8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)]; \
+        } else { \
+            [enc dispatchThreadgroups:MTLSizeMake(_od, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)]; \
+        } \
+        [enc endEncoding]; \
+    } while (0)
+
+    ENC_MV(lc->q_w, lc->q_s, lc->q_b, s->batch_out[0], q_proj_dim, s->buf_input);
+    ENC_MV(lc->k_w, lc->k_s, lc->k_b, s->batch_out[1], kv_dim,     s->buf_input);
+    ENC_MV(lc->v_w, lc->v_s, lc->v_b, s->batch_out[2], kv_dim,     s->buf_input);
+    #undef ENC_MV
+}
+
+// Encode CMD2: attention + o_proj + residual + norm + routing + shared expert prep
+// Requires buf_attn_q_slot[t] and buf_attn_gate_slot[t] to be populated by the CPU
+// between CMD1 and CMD2 (with Q after RoPE + QK norm, and the sigmoid gate values).
+static void encode_slot_cmd2_attn_post(
+    id<MTLCommandBuffer> cmd,
+    SlotFullAttnBufs *s,
+    LayerWeightCache *lc,
+    int fa_idx,
+    int kv_len
+) {
+    MetalCtx *ctx = g_metal;
+    uint32_t kv_dim = NUM_KV_HEADS * HEAD_DIM;
+    uint32_t q_dim = NUM_ATTN_HEADS * HEAD_DIM;
+    uint32_t hd = HEAD_DIM;
+    uint32_t kvd = kv_dim;
+    uint32_t sl = (uint32_t)kv_len;
+    uint32_t seq_stride = GPU_KV_SEQ;
+    uint32_t hpkv = NUM_ATTN_HEADS / NUM_KV_HEADS;
+    float scale = 1.0f / sqrtf((float)HEAD_DIM);
+
+    // Enc A1: attn_scores
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->attn_scores_pipe];
+        [enc setBuffer:s->buf_attn_q          offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_kv_k[fa_idx]  offset:0 atIndex:1];
+        [enc setBuffer:s->buf_attn_scores     offset:0 atIndex:2];
+        [enc setBytes:&hd length:4 atIndex:3]; [enc setBytes:&kvd length:4 atIndex:4];
+        [enc setBytes:&sl length:4 atIndex:5]; [enc setBytes:&seq_stride length:4 atIndex:6];
+        [enc setBytes:&scale length:4 atIndex:7]; [enc setBytes:&hpkv length:4 atIndex:8];
+        [enc setBytes:&sl length:4 atIndex:9];
+        [enc dispatchThreadgroups:MTLSizeMake(sl * NUM_ATTN_HEADS, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc A2: softmax
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->attn_softmax_pipe];
+        [enc setBuffer:s->buf_attn_scores offset:0 atIndex:0];
+        [enc setBytes:&sl length:4 atIndex:1]; [enc setBytes:&seq_stride length:4 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(NUM_ATTN_HEADS, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc A3: values
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->attn_values_pipe];
+        [enc setBuffer:s->buf_attn_scores    offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_kv_v[fa_idx] offset:0 atIndex:1];
+        [enc setBuffer:s->buf_attn_out       offset:0 atIndex:2];
+        [enc setBytes:&hd length:4 atIndex:3]; [enc setBytes:&kvd length:4 atIndex:4];
+        [enc setBytes:&sl length:4 atIndex:5]; [enc setBytes:&seq_stride length:4 atIndex:6];
+        [enc setBytes:&hpkv length:4 atIndex:7];
+        uint32_t tt = HEAD_DIM * NUM_ATTN_HEADS;
+        [enc dispatchThreadgroups:MTLSizeMake((tt+255)/256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc A4: sigmoid gate
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->sigmoid_gate_pipe];
+        [enc setBuffer:s->buf_attn_out offset:0 atIndex:0];
+        [enc setBuffer:s->buf_attn_gate offset:0 atIndex:1];
+        uint32_t qdim = q_dim;
+        [enc setBytes:&qdim length:4 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((qdim+255)/256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc 1: o_proj
+    {
+        NSUInteger w_off = (NSUInteger)((const char *)lc->o_w - (const char *)[ctx->wf_buf contents]);
+        NSUInteger s_off = (NSUInteger)((const char *)lc->o_s - (const char *)[ctx->wf_buf contents]);
+        NSUInteger b_off = (NSUInteger)((const char *)lc->o_b - (const char *)[ctx->wf_buf contents]);
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        uint32_t oo = HIDDEN_DIM, oi = q_dim, ogs = GROUP_SIZE;
+        [enc setComputePipelineState:ctx->matvec_fast];
+        [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
+        [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
+        [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
+        [enc setBuffer:s->buf_attn_out offset:0 atIndex:3];
+        [enc setBuffer:s->buf_output offset:0 atIndex:4];
+        [enc setBytes:&oo length:4 atIndex:5]; [enc setBytes:&oi length:4 atIndex:6];
+        [enc setBytes:&ogs length:4 atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake(oo, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc 2: residual_add
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        uint32_t dim = HIDDEN_DIM;
+        [enc setComputePipelineState:ctx->residual_add];
+        [enc setBuffer:s->buf_residual offset:0 atIndex:0];
+        [enc setBuffer:s->buf_output offset:0 atIndex:1];
+        [enc setBuffer:s->buf_h_mid offset:0 atIndex:2];
+        [enc setBytes:&dim length:4 atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((dim+255)/256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc 3: rms_norm_sum
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        uint32_t dim = HIDDEN_DIM;
+        [enc setComputePipelineState:ctx->rms_norm_sum];
+        [enc setBuffer:s->buf_h_mid offset:0 atIndex:0];
+        [enc setBuffer:s->buf_sum_sq offset:0 atIndex:1];
+        [enc setBytes:&dim length:4 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc 4: rms_norm_apply_bf16 → buf_input (for routing projections)
+    {
+        NSUInteger noff = (NSUInteger)((const char *)lc->post_attn_norm_w - (const char *)[ctx->wf_buf contents]);
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        uint32_t dim = HIDDEN_DIM; float eps = RMS_NORM_EPS;
+        [enc setComputePipelineState:ctx->rms_norm_apply_bf16];
+        [enc setBuffer:s->buf_h_mid offset:0 atIndex:0];
+        [enc setBuffer:ctx->wf_buf offset:noff atIndex:1];
+        [enc setBuffer:s->buf_sum_sq offset:0 atIndex:2];
+        [enc setBuffer:s->buf_input offset:0 atIndex:3];
+        [enc setBytes:&dim length:4 atIndex:4]; [enc setBytes:&eps length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((dim+255)/256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // Enc 5-8: routing + shared expert projections (read from buf_input)
+    #define ENC_MV2(W, S_, B, OUT_BUF, OUT_DIM) do { \
+        NSUInteger w_off = (NSUInteger)((const char *)(W)  - (const char *)[ctx->wf_buf contents]); \
+        NSUInteger s_off = (NSUInteger)((const char *)(S_) - (const char *)[ctx->wf_buf contents]); \
+        NSUInteger b_off = (NSUInteger)((const char *)(B)  - (const char *)[ctx->wf_buf contents]); \
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder]; \
+        int use_v3 = (HIDDEN_DIM <= 4096); \
+        [enc setComputePipelineState:(use_v3 ? ctx->matvec_v3 : ctx->matvec_fast)]; \
+        [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0]; \
+        [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1]; \
+        [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2]; \
+        [enc setBuffer:s->buf_input offset:0 atIndex:3]; \
+        [enc setBuffer:(OUT_BUF) offset:0 atIndex:4]; \
+        uint32_t _od = (OUT_DIM); uint32_t _id = HIDDEN_DIM; uint32_t _gs = GROUP_SIZE; \
+        [enc setBytes:&_od length:4 atIndex:5]; [enc setBytes:&_id length:4 atIndex:6]; \
+        [enc setBytes:&_gs length:4 atIndex:7]; \
+        if (use_v3) { [enc dispatchThreadgroups:MTLSizeMake((_od+7)/8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)]; } \
+        else { [enc dispatchThreadgroups:MTLSizeMake(_od, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)]; } \
+        [enc endEncoding]; \
+    } while (0)
+    ENC_MV2(lc->gate_w, lc->gate_s, lc->gate_b, s->batch_out[3],     NUM_EXPERTS);
+    ENC_MV2(lc->sg_w,   lc->sg_s,   lc->sg_b,   s->buf_shared_gate,  SHARED_INTERMEDIATE);
+    ENC_MV2(lc->su_w,   lc->su_s,   lc->su_b,   s->buf_shared_up,    SHARED_INTERMEDIATE);
+    ENC_MV2(lc->seg_w,  lc->seg_s,  lc->seg_b,  s->buf_shared_egate,  1);
+    #undef ENC_MV2
+}
+
+// ============================================================================
+// Multi-slot full-attention layer: process T tokens through ONE full-attention
+// layer using per-slot parallel GPU dispatch.
+//
+// Flow:
+//   1. CPU: input_norm for each slot → buf_input_slot[t]
+//   2. GPU: dispatch T CMD1 (Q/K/V projections) on T queues → commit all → wait all
+//   3. CPU: for each slot — read back Q/K/V, do QK norm + RoPE, write to KV cache,
+//          copy Q → buf_attn_q_slot[t], gate → buf_attn_gate_slot[t]
+//   4. GPU: dispatch T CMD2 (attention + post-attn) on T queues → commit all → wait all
+//   5. CPU: for each slot — read back h_mid → hidden_batch[t]
+//   6. Expert dispatch — serial per token using existing fused_layer_forward CMD3 path
+//      (deferred to the caller; this function only handles attention + post-attention)
+//
+// Returns with hidden_batch updated to h_mid (= residual + o_proj) for each slot.
+// buf_input_slot[t] contains h_post (post-attn-normed, for expert routing).
+// batch_out_slot[t][3] contains gate_scores (routing logits).
+// ============================================================================
+static void multi_slot_full_attn_layer(
+    WeightFile *wf,
+    int layer_idx,
+    float *hidden_batch,  // [T * HIDDEN_DIM] in/out
+    int T,
+    KVCache *kv,
+    int pos_start
+) {
+    init_layer_scratch();
+    if (!layer_cache_built) build_layer_cache(wf);
+    init_multi_slot_bufs(g_metal);
+
+    LayerWeightCache *lc = &layer_cache[layer_idx];
+    int fa_idx = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1;
+    int kv_dim = NUM_KV_HEADS * HEAD_DIM;
+    int q_dim = NUM_ATTN_HEADS * HEAD_DIM;
+    int kv_len_before = kv->len;
+
+    // Validate: must be a full-attention layer with sufficient kv_len for GPU path
+    if (fa_idx < 0 || fa_idx >= NUM_FULL_ATTN_LAYERS) return;
+    if (!lc->q_w || !lc->o_w || !lc->post_attn_norm_w || !lc->gate_w) return;
+
+    // ---- Step 1: CPU input norm for each slot ----
+    for (int t = 0; t < T; t++) {
+        float *hidden_t = hidden_batch + (size_t)t * HIDDEN_DIM;
+        float *norm_dst = (float *)[g_metal->buf_input_slot[t] contents];
+        cpu_rms_norm(hidden_t, lc->input_norm_w, norm_dst, HIDDEN_DIM, RMS_NORM_EPS);
+        // Save residual for CMD2's residual_add
+        memcpy([g_metal->buf_residual_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
+    }
+
+    // ---- Step 2: Dispatch T CMD1 (projections) in parallel ----
+    id<MTLCommandBuffer> cmd1s[MAX_MULTI_T];
+    for (int t = 0; t < T; t++) {
+        SlotFullAttnBufs sb = get_slot_bufs_from_ctx(g_metal, t);
+        cmd1s[t] = [g_metal->queue_slot[t] commandBuffer];
+        encode_slot_cmd1_proj(cmd1s[t], &sb, lc);
+        [cmd1s[t] commit];
+    }
+    for (int t = 0; t < T; t++) {
+        [cmd1s[t] waitUntilCompleted];
+    }
+
+    // ---- Step 3: CPU attention work per slot (serial, ~0.08 ms × T) ----
+    for (int t = 0; t < T; t++) {
+        // Read back Q projection (interleaved q+gate per head)
+        float *q_proj_raw = (float *)[g_metal->batch_out_slot[t][0] contents];
+        float *k_raw      = (float *)[g_metal->batch_out_slot[t][1] contents];
+        float *v_raw      = (float *)[g_metal->batch_out_slot[t][2] contents];
+
+        // Split q_proj into q and q_gate
+        float q[NUM_ATTN_HEADS * HEAD_DIM];
+        float q_gate[NUM_ATTN_HEADS * HEAD_DIM];
+        for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+            const float *src = q_proj_raw + h * (2 * HEAD_DIM);
+            memcpy(q + h * HEAD_DIM, src, HEAD_DIM * sizeof(float));
+            memcpy(q_gate + h * HEAD_DIM, src + HEAD_DIM, HEAD_DIM * sizeof(float));
+        }
+
+        // Q RMS norm (per-head)
+        if (lc->q_norm_w) {
+            for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+                float *qh = q + h * HEAD_DIM;
+                float sum_sq = 0;
+                for (int d = 0; d < HEAD_DIM; d++) sum_sq += qh[d] * qh[d];
+                float inv_rms = 1.0f / sqrtf(sum_sq / HEAD_DIM + RMS_NORM_EPS);
+                for (int d = 0; d < HEAD_DIM; d++)
+                    qh[d] = qh[d] * inv_rms * bf16_to_f32(lc->q_norm_w[d]);
+            }
+        }
+        // K RMS norm
+        if (lc->k_norm_w) {
+            for (int h = 0; h < NUM_KV_HEADS; h++) {
+                float *kh = k_raw + h * HEAD_DIM;
+                float sum_sq = 0;
+                for (int d = 0; d < HEAD_DIM; d++) sum_sq += kh[d] * kh[d];
+                float inv_rms = 1.0f / sqrtf(sum_sq / HEAD_DIM + RMS_NORM_EPS);
+                for (int d = 0; d < HEAD_DIM; d++)
+                    kh[d] = kh[d] * inv_rms * bf16_to_f32(lc->k_norm_w[d]);
+            }
+        }
+
+        // RoPE
+        apply_rotary_emb(q, k_raw, pos_start + t, NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM, ROTARY_DIM);
+
+        // Write K/V to CPU KV cache
+        int cache_pos = kv_len_before + t;
+        memcpy(kv->k_cache + (size_t)cache_pos * kv_dim, k_raw, kv_dim * sizeof(float));
+        memcpy(kv->v_cache + (size_t)cache_pos * kv_dim, v_raw, kv_dim * sizeof(float));
+
+        // Write K/V to GPU KV buffer mirror (shared — slots write different positions)
+        memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + (size_t)cache_pos * kv_dim,
+               k_raw, kv_dim * sizeof(float));
+        memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + (size_t)cache_pos * kv_dim,
+               v_raw, kv_dim * sizeof(float));
+
+        // Copy Q → buf_attn_q_slot[t], gate → buf_attn_gate_slot[t]
+        memcpy([g_metal->buf_attn_q_slot[t] contents], q, q_dim * sizeof(float));
+        memcpy([g_metal->buf_attn_gate_slot[t] contents], q_gate, q_dim * sizeof(float));
+    }
+
+    // Update KV cache length
+    kv->len = kv_len_before + T;
+
+    // ---- Step 4: Dispatch T CMD2 (attention + post-attn) in parallel ----
+    id<MTLCommandBuffer> cmd2s[MAX_MULTI_T];
+    for (int t = 0; t < T; t++) {
+        SlotFullAttnBufs sb = get_slot_bufs_from_ctx(g_metal, t);
+        cmd2s[t] = [g_metal->queue_slot[t] commandBuffer];
+        encode_slot_cmd2_attn_post(cmd2s[t], &sb, lc, fa_idx, kv_len_before + T);
+        [cmd2s[t] commit];
+    }
+    for (int t = 0; t < T; t++) {
+        [cmd2s[t] waitUntilCompleted];
+    }
+
+    // ---- Step 5: Read back hidden state per slot ----
+    for (int t = 0; t < T; t++) {
+        float *hidden_t = hidden_batch + (size_t)t * HIDDEN_DIM;
+        // h_mid = residual + o_proj (written by CMD2's residual_add → buf_h_mid_slot[t])
+        memcpy(hidden_t, [g_metal->buf_h_mid_slot[t] contents], HIDDEN_DIM * sizeof(float));
+    }
+
+    // NOTE: Expert dispatch (CMD3) is NOT handled here. The caller must dispatch
+    // experts per token after this function returns. hidden_batch[t] contains
+    // h_mid. buf_input_slot[t] contains h_post (post-attn-normed, for routing).
+    // batch_out_slot[t][3] contains gate_scores (routing logits).
+}
+
 static SlotFullAttnBufs alloc_slot_full_attn_bufs(id<MTLDevice> dev) {
     SlotFullAttnBufs s;
     int q_dim = NUM_ATTN_HEADS * HEAD_DIM;
