@@ -40,3 +40,7 @@ logs/
 metal_infer/test_lzfse
 metal_infer/repack_experts_lz4
 metal_infer/routing_data.bin
+# Stale files
+metal_infer/infer.m.bak*
+metal_infer/infer.m.debug_backup
+metal_infer/infer.m.bak_diag
