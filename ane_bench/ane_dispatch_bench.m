@@ -35,8 +35,17 @@ static int cmp_double(const void *a, const void *b) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        const char *path = (argc >= 2) ? argv[1]
+        // Usage: ane_dispatch_bench [path.mlmodelc] [--fm-linear]
+        //   --fm-linear : use the flash_moe single-layer input signature
+        //                 (hidden_states + one gated_state + one conv_state,
+        //                 no cos/sin). Default is the anemll-qwen35 super-block
+        //                 signature (9 inputs).
+        const char *path = (argc >= 2 && argv[1][0] != '-') ? argv[1]
             : "/Users/carl/projects/turbomoe/flash_moe/ane_bench/superblock0.mlmodelc";
+        int fm_linear = 0;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--fm-linear") == 0) fm_linear = 1;
+        }
         NSURL *url = [NSURL fileURLWithPath:@(path)];
 
         NSError *err = nil;
@@ -59,22 +68,33 @@ int main(int argc, const char *argv[]) {
         }
         printf("Model load: %.1f ms (one-shot)\n", (t_load1 - t_load0) * 1000.0);
 
-        // --- 2. Build zero-filled inputs matching the super-block signature ---
+        // --- 2. Build zero-filled inputs matching the selected signature ---
         NSMutableDictionary<NSString *, MLMultiArray *> *inputs = [NSMutableDictionary new];
         #define MK(name, ...) do { \
             MLMultiArray *__a = makeArray(@[__VA_ARGS__], &err); \
             if (!__a) { NSLog(@"makeArray %s: %@", name, err); return 1; } \
             inputs[@name] = __a; \
         } while(0)
-        MK("hidden_states",   @1, @1, @4096);
-        MK("cos",             @1, @1, @1, @64);
-        MK("sin",             @1, @1, @1, @64);
-        MK("gated_state_0",   @1, @32, @128, @128);
-        MK("conv_state_0",    @1, @3, @8192);
-        MK("gated_state_1",   @1, @32, @128, @128);
-        MK("conv_state_1",    @1, @3, @8192);
-        MK("gated_state_2",   @1, @32, @128, @128);
-        MK("conv_state_2",    @1, @3, @8192);
+
+        if (fm_linear) {
+            // flash_moe single linear layer: Hv=64, conv_dim=12288
+            printf("Input signature: flash_moe single linear layer\n");
+            MK("hidden_states", @1, @1, @4096);
+            MK("gated_state",   @1, @64, @128, @128);
+            MK("conv_state",    @1, @3, @12288);
+        } else {
+            // anemll-qwen35 super-block 0 (DDDA, Hv=32, conv_dim=8192)
+            printf("Input signature: anemll-qwen35 super-block 0\n");
+            MK("hidden_states",   @1, @1, @4096);
+            MK("cos",             @1, @1, @1, @64);
+            MK("sin",             @1, @1, @1, @64);
+            MK("gated_state_0",   @1, @32, @128, @128);
+            MK("conv_state_0",    @1, @3, @8192);
+            MK("gated_state_1",   @1, @32, @128, @128);
+            MK("conv_state_1",    @1, @3, @8192);
+            MK("gated_state_2",   @1, @32, @128, @128);
+            MK("conv_state_2",    @1, @3, @8192);
+        }
         #undef MK
 
         MLDictionaryFeatureProvider *features =
@@ -142,20 +162,19 @@ int main(int argc, const char *argv[]) {
         printf("    max:  %.3f ms\n", sorted[N - 1]);
         printf("    mean: %.3f ms\n", mean);
 
-        printf("\n=== Decision gate ===\n");
-        printf("  anemll-qwen35 reference pure-ANE time (super-block 0): 9.28 ms\n");
-        printf("  p50 overhead above reference: %+.3f ms\n", sorted[N / 2] - 9.28);
-        printf("  p90 overhead above reference: %+.3f ms\n", sorted[(int)(N * 0.90)] - 9.28);
-        printf("\n");
-        double overhead_p90 = sorted[(int)(N * 0.90)] - 9.28;
-        if (overhead_p90 < 1.0) {
-            printf("  VERDICT: p90 overhead < 1 ms — ANE offload is VIABLE.\n");
-        } else if (overhead_p90 < 2.0) {
-            printf("  VERDICT: p90 overhead 1-2 ms — ANE offload is MARGINAL.\n");
-            printf("  Consider the data-transfer cost on top of this.\n");
+        if (fm_linear) {
+            printf("\n=== flash_moe extrapolation ===\n");
+            printf("  This is ONE linear layer (unbundled). flash_moe has 45 such layers\n");
+            printf("  per token (interspersed with 15 full-attention layers).\n");
+            printf("  Naive extrapolation (no bundling):\n");
+            printf("    45 × p50 = %.1f ms/token linear compute\n", 45.0 * sorted[N/2]);
+            printf("  Current warm-cache baseline: ~150 ms/token (full stack).\n");
+            printf("  Needs super-block bundling + LUT4 quantization to be viable.\n");
         } else {
-            printf("  VERDICT: p90 overhead > 2 ms — ANE offload is BLOCKED.\n");
-            printf("  Pivot to mixed-bit per-expert quantization (priority #2).\n");
+            printf("\n=== Decision gate ===\n");
+            printf("  anemll-qwen35 reference pure-ANE time (super-block 0): 9.28 ms\n");
+            printf("  p50 overhead above reference: %+.3f ms\n", sorted[N / 2] - 9.28);
+            printf("  p90 overhead above reference: %+.3f ms\n", sorted[(int)(N * 0.90)] - 9.28);
         }
 
         free(sorted);
