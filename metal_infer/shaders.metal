@@ -1763,6 +1763,228 @@ kernel void fused_flash_attention_fp16(
 
 
 // ============================================================================
+// Fused flash-attention for non-TQ path with fp16 KV cache — TILED version
+// ============================================================================
+//
+// Improvement over fused_flash_attention_fp16:
+//   The original kernel has each simdgroup independently reading K/V from
+//   device memory for every position it processes.  With 8 simdgroups all
+//   reading the same (strided) positions, there is no K/V data reuse inside
+//   the threadgroup — each half2 word is fetched 8 times.
+//
+//   This version processes KV positions in blocks of TILE_KV (= 32).
+//   All 256 threads cooperate to load each K block (32×256 fp16 = 16 KB)
+//   into threadgroup memory, then all simdgroups compute their Q·K scores
+//   from shared memory.  The same buffer is then reloaded with the V block
+//   and each simdgroup accumulates its partial output.  Result: each K and
+//   each V value is fetched from device memory exactly once per threadgroup
+//   instead of once per simdgroup.
+//
+// Threadgroup memory layout (fits under 32 KB):
+//   tg_kv  [TILE_KV * HEAD_DIM]  half  : 32×256×2 = 16384 bytes   (K or V block)
+//   tg_acc [NUM_SG * HEAD_DIM]   float : 8×256×4  =  8192 bytes
+//   tg_max [NUM_SG]              float : 8×4      =    32 bytes
+//   tg_sum [NUM_SG]              float : 8×4      =    32 bytes
+//   tg_global_max, tg_global_sum float : 2×4      =     8 bytes
+//   ─────────────────────────────────────────────────────────────────
+//   Total: 16384 + 8192 + 32 + 32 + 8 = 24648 bytes  (< 32768)
+//
+// Grid: (NUM_ATTN_HEADS, 1, 1) — one threadgroup per head
+// Threads: 256 (8 simdgroups × 32 lanes)
+// ============================================================================
+
+#define TILE_KV 32
+
+kernel void fused_flash_attention_fp16_tiled(
+    device const float*  Q         [[buffer(0)]],   // [NUM_ATTN_HEADS, HEAD_DIM]
+    device const float*  Q_gate    [[buffer(1)]],   // [NUM_ATTN_HEADS, HEAD_DIM]
+    device const half*   K_cache   [[buffer(2)]],   // [max_seq, kv_dim] fp16
+    device const half*   V_cache   [[buffer(3)]],   // [max_seq, kv_dim] fp16
+    device       float*  attn_out  [[buffer(4)]],   // [NUM_ATTN_HEADS, HEAD_DIM]
+    constant     uint&   seq_len   [[buffer(5)]],   // current KV cache length
+    constant     uint&   kv_dim    [[buffer(6)]],   // NUM_KV_HEADS * HEAD_DIM = 512
+    constant     uint&   heads_per_kv [[buffer(7)]], // 16 (GQA ratio)
+    uint tgid [[threadgroup_position_in_grid]],      // head index
+    uint lid  [[thread_position_in_threadgroup]],
+    uint sid  [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint head   = tgid;
+    const uint kv_head = head / heads_per_kv;
+    const uint num_sg  = 8;                         // THREADS_PER_HEAD / SIMD_SIZE
+    const float scale  = rsqrt((float)HEAD_DIM);
+
+    // ---- Load Q into registers (8 elements per lane, 32 lanes × 8 = 256) ----
+    float q_local[LANES_PER_SIMD];
+    float gate_local[LANES_PER_SIMD];
+    for (int i = 0; i < LANES_PER_SIMD; i++) {
+        uint d = lane + i * SIMD_SIZE;
+        q_local[i]    = (d < (uint)HEAD_DIM) ? Q   [head * HEAD_DIM + d] : 0.0f;
+        gate_local[i] = (d < (uint)HEAD_DIM) ? Q_gate[head * HEAD_DIM + d] : 0.0f;
+    }
+
+    // ---- Per-simdgroup online-softmax accumulators ----
+    float local_acc[LANES_PER_SIMD];
+    for (int i = 0; i < LANES_PER_SIMD; i++) local_acc[i] = 0.0f;
+    float local_max = -1e10f;
+    float local_sum = 0.0f;
+
+    // ---- Threadgroup buffers ----
+    // tg_kv is reused for K and V; tg_scores holds one score per thread
+    // in this tile (only num_sg scores matter per simdgroup).
+    threadgroup half  tg_kv [TILE_KV * HEAD_DIM];   // 16 KB — current K or V block
+    threadgroup float tg_scores[num_sg * TILE_KV];  // 8 × 32 = 256 floats = 1 KB
+    // Layout: tg_scores[s * TILE_KV + tile_pos] for simdgroup s, tile position tile_pos
+
+    // ---- Phase 1: Iterate over KV blocks ----
+    const uint kv_base = kv_head * HEAD_DIM;  // offset within a KV row
+
+    for (uint block_start = 0; block_start < seq_len; block_start += TILE_KV) {
+        uint block_end = min(block_start + (uint)TILE_KV, seq_len);
+        uint tile_size = block_end - block_start;  // ≤ TILE_KV (last block may be smaller)
+
+        // ---- Load K block into threadgroup memory ----
+        // All 256 threads cooperate: thread lid loads element (p, d) where
+        //   p = lid / HEAD_DIM   (only valid for lid < tile_size * HEAD_DIM)
+        //   d = lid % HEAD_DIM
+        // We need to load tile_size × HEAD_DIM half values.  With 256 threads
+        // and HEAD_DIM=256 we get exactly TILE_KV/1 rounds for TILE_KV=32 even
+        // though each round loads 256 elements (one column of the K block).
+        //
+        // Simpler: split the 32×256=8192 loads among 256 threads = 32 loads each.
+        for (uint t = lid; t < (uint)(TILE_KV * HEAD_DIM); t += 256) {
+            uint tp = t / HEAD_DIM;   // position index within tile
+            uint td = t % HEAD_DIM;
+            uint global_p = block_start + tp;
+            tg_kv[t] = (global_p < seq_len)
+                ? K_cache[global_p * kv_dim + kv_base + td]
+                : (half)0.0h;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- Compute Q·K scores for this tile ----
+        // Each simdgroup s handles positions: s, s+num_sg, s+2*num_sg, ...
+        // within [0, tile_size).
+        for (uint tp = sid; tp < tile_size; tp += num_sg) {
+            float partial_dot = 0.0f;
+            for (int i = 0; i < LANES_PER_SIMD; i++) {
+                uint d = lane + i * SIMD_SIZE;
+                if (d < (uint)HEAD_DIM) {
+                    float k_val = (float)tg_kv[tp * HEAD_DIM + d];
+                    partial_dot += q_local[i] * k_val;
+                }
+            }
+            float dot   = simd_sum(partial_dot);
+            float score = dot * scale;
+            // lane 0 of each simdgroup writes the score (all lanes read it below)
+            if (lane == 0) {
+                tg_scores[sid * TILE_KV + tp] = score;
+            }
+        }
+        // Simdgroup-internal barrier isn't needed — lane 0 wrote, all other lanes
+        // in the same simdgroup will read in the same simdgroup below, but we need
+        // a threadgroup barrier before the V phase anyway, so one barrier is enough.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- Online-softmax update + V accumulation for this tile ----
+        // Load V block into tg_kv (overwriting K block — K scores are already saved).
+        for (uint t = lid; t < (uint)(TILE_KV * HEAD_DIM); t += 256) {
+            uint tp = t / HEAD_DIM;
+            uint td = t % HEAD_DIM;
+            uint global_p = block_start + tp;
+            tg_kv[t] = (global_p < seq_len)
+                ? V_cache[global_p * kv_dim + kv_base + td]
+                : (half)0.0h;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Each simdgroup processes the same tile positions it scored above.
+        for (uint tp = sid; tp < tile_size; tp += num_sg) {
+            float score = tg_scores[sid * TILE_KV + tp];
+
+            float new_max  = max(local_max, score);
+            float exp_old  = metal::fast::exp(local_max - new_max);
+            float exp_new  = metal::fast::exp(score     - new_max);
+
+            for (int i = 0; i < LANES_PER_SIMD; i++) {
+                uint d = lane + i * SIMD_SIZE;
+                if (d < (uint)HEAD_DIM) {
+                    float v_val = (float)tg_kv[tp * HEAD_DIM + d];
+                    local_acc[i] = local_acc[i] * exp_old + exp_new * v_val;
+                }
+            }
+            local_max  = new_max;
+            local_sum  = local_sum * exp_old + exp_new;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- Phase 2: Write per-simdgroup results to threadgroup memory ----
+    // Reuse tg_kv memory region as tg_acc (float, 8×256×4 = 8192 < 16384 bytes).
+    // Cast via a pointer union — this is safe because we are past all KV tile loops.
+    threadgroup float* tg_acc = (threadgroup float*)tg_kv;
+    // tg_scores still holds the last tile's scores but we no longer need them.
+    // Reuse tg_scores as tg_max/tg_sum (8+8 floats = 64 bytes < 1024 bytes).
+    threadgroup float* tg_max_sg  = (threadgroup float*)tg_scores;              // [8]
+    threadgroup float* tg_sum_sg  = (threadgroup float*)tg_scores + num_sg;     // [8]
+    threadgroup float* tg_gmax    = (threadgroup float*)tg_scores + 2 * num_sg; // [1]
+    threadgroup float* tg_gsum    = (threadgroup float*)tg_scores + 2 * num_sg + 1; // [1]
+
+    if (lane == 0) {
+        tg_max_sg[sid] = local_max;
+        tg_sum_sg[sid] = local_sum;
+    }
+    for (int i = 0; i < LANES_PER_SIMD; i++) {
+        uint d = lane + i * SIMD_SIZE;
+        if (d < (uint)HEAD_DIM) {
+            tg_acc[sid * HEAD_DIM + d] = local_acc[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Phase 3a: Global max/sum (thread 0) ----
+    if (lid == 0) {
+        float gmax = -1e10f;
+        for (uint s = 0; s < num_sg; s++) gmax = max(gmax, tg_max_sg[s]);
+        float gsum = 0.0f;
+        for (uint s = 0; s < num_sg; s++)
+            gsum += tg_sum_sg[s] * metal::fast::exp(tg_max_sg[s] - gmax);
+        *tg_gmax = gmax;
+        *tg_gsum = gsum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Phase 3b: Combine simdgroup accumulators (simdgroup 0) ----
+    float global_max = *tg_gmax;
+    float inv_sum    = (*tg_gsum > 1e-8f) ? (1.0f / *tg_gsum) : 0.0f;
+
+    if (sid == 0) {
+        for (int i = 0; i < LANES_PER_SIMD; i++) {
+            uint d = lane + i * SIMD_SIZE;
+            if (d >= (uint)HEAD_DIM) continue;
+            float accum = 0.0f;
+            for (uint s = 0; s < num_sg; s++) {
+                float factor = metal::fast::exp(tg_max_sg[s] - global_max);
+                accum += tg_acc[s * HEAD_DIM + d] * factor;
+            }
+            tg_acc[d] = accum * inv_sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Phase 4: Apply sigmoid gate and write output ----
+    for (int i = 0; i < LANES_PER_SIMD; i++) {
+        uint d = lane + i * SIMD_SIZE;
+        if (d < (uint)HEAD_DIM) {
+            float val = tg_acc[d];
+            float g   = 1.0f / (1.0f + metal::fast::exp(-gate_local[i]));
+            attn_out[head * HEAD_DIM + d] = val * g;
+        }
+    }
+}
+
+
+// ============================================================================
 // Kernel 2: tq_pack_update
 // ============================================================================
 //

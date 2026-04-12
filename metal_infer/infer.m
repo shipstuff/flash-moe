@@ -985,7 +985,8 @@ typedef struct {
     id<MTLComputePipelineState> attn_values_pipe;
     id<MTLComputePipelineState> sigmoid_gate_pipe;
     id<MTLComputePipelineState> fullattn_norm_rope_pipe; // GPU RoPE+norm for CMD1+CMD2 fusion
-    id<MTLComputePipelineState> fused_flash_attn_pipe;  // fused flash-attention with fp16 KV
+    id<MTLComputePipelineState> fused_flash_attn_pipe;       // fused flash-attention with fp16 KV (untiled)
+    id<MTLComputePipelineState> fused_flash_attn_tiled_pipe; // tiled version — preferred at long context
     id<MTLComputePipelineState> tq_rotate_q_pipe;       // GPU Q × Pi^T rotation for TQ CMD1 fusion
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [HIDDEN_DIM or max projection input]
@@ -1216,10 +1217,12 @@ static MetalCtx *metal_setup(void) {
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
     ctx->fullattn_norm_rope_pipe = makePipe(@"fullattn_norm_rope_kv");
-    ctx->fused_flash_attn_pipe = makePipe(@"fused_flash_attention_fp16");
+    ctx->fused_flash_attn_pipe       = makePipe(@"fused_flash_attention_fp16");
+    ctx->fused_flash_attn_tiled_pipe = makePipe(@"fused_flash_attention_fp16_tiled");
     ctx->tq_rotate_q_pipe = makePipe(@"tq_rotate_q");
     if (ctx->fullattn_norm_rope_pipe) printf("[metal] GPU RoPE+norm kernel ready (CMD1+CMD2 fusion for full-attn)\n");
-    if (ctx->fused_flash_attn_pipe) printf("[metal] Fused flash-attention (fp16 KV) ready\n");
+    if (ctx->fused_flash_attn_pipe)       printf("[metal] Fused flash-attention (fp16 KV) ready\n");
+    if (ctx->fused_flash_attn_tiled_pipe) printf("[metal] Fused flash-attention TILED (fp16 KV) ready\n");
     if (ctx->tq_rotate_q_pipe) printf("[metal] GPU Q rotation ready (TQ CMD1 fusion)\n");
     ctx->tq_fused_attn_pipe  = makePipe(@"tq_fused_attention");
     ctx->tq_encode_pipe      = makePipe(@"tq_encode_packed");
@@ -5421,12 +5424,20 @@ static void fused_layer_forward(
                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                     [enc endEncoding];
                 }
-            } else if (g_metal->fused_flash_attn_pipe && g_metal->buf_kv_k_f16[fa_idx]) {
+            } else if ((g_metal->fused_flash_attn_tiled_pipe || g_metal->fused_flash_attn_pipe)
+                        && g_metal->buf_kv_k_f16[fa_idx]) {
+                // Context-adaptive: tiled kernel at seq_len >= 512 (bandwidth-bound),
+                // untiled below (tiling overhead exceeds bandwidth savings at short context)
                 uint32_t sl = (uint32_t)(kv->len + 1);
+                id<MTLComputePipelineState> fa_pipe =
+                    (g_metal->fused_flash_attn_tiled_pipe && sl >= 512)
+                        ? g_metal->fused_flash_attn_tiled_pipe
+                        : (g_metal->fused_flash_attn_pipe ? g_metal->fused_flash_attn_pipe
+                           : g_metal->fused_flash_attn_tiled_pipe);
                 uint32_t kvd = (uint32_t)kv_dim_l;
                 uint32_t hpkv = NUM_ATTN_HEADS / NUM_KV_HEADS;
                 id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->fused_flash_attn_pipe];
+                [enc setComputePipelineState:fa_pipe];
                 [enc setBuffer:g_metal->buf_attn_q            offset:0 atIndex:0];
                 [enc setBuffer:g_metal->buf_attn_gate         offset:0 atIndex:1];
                 [enc setBuffer:g_metal->buf_kv_k_f16[fa_idx]  offset:0 atIndex:2];
@@ -6531,12 +6542,16 @@ static void fused_layer_forward(
                     if (g_timing_enabled && g_tq_sample_count < TQ_HIST_MAX)
                         g_tq_samples[g_tq_sample_count++] = (float)hedge_elapsed;
                 }
-            } else if (g_metal->fused_flash_attn_pipe && g_metal->buf_kv_k_f16[fa_idx]) {
-                // Fused flash-attention with fp16 KV cache — single kernel replaces
-                // scores + softmax + values (eliminates 25MB scores buffer at 200k ctx)
-                // + sigmoid gate is fused in
+            } else if ((g_metal->fused_flash_attn_tiled_pipe || g_metal->fused_flash_attn_pipe)
+                        && g_metal->buf_kv_k_f16[fa_idx]) {
+                // Context-adaptive: tiled at seq_len >= 512, untiled below
+                id<MTLComputePipelineState> fa_pipe =
+                    (g_metal->fused_flash_attn_tiled_pipe && sl >= 512)
+                        ? g_metal->fused_flash_attn_tiled_pipe
+                        : (g_metal->fused_flash_attn_pipe ? g_metal->fused_flash_attn_pipe
+                           : g_metal->fused_flash_attn_tiled_pipe);
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->fused_flash_attn_pipe];
+                [enc setComputePipelineState:fa_pipe];
                 [enc setBuffer:g_metal->buf_attn_q            offset:0 atIndex:0];
                 [enc setBuffer:g_metal->buf_attn_gate         offset:0 atIndex:1];
                 [enc setBuffer:g_metal->buf_kv_k_f16[fa_idx]  offset:0 atIndex:2];
