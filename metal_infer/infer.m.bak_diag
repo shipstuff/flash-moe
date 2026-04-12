@@ -1123,12 +1123,9 @@ typedef struct {
     id<MTLBuffer> buf_shared_up_slot[MAX_MULTI_T];        // [SHARED_INTERMEDIATE]
     id<MTLBuffer> buf_shared_act_slot[MAX_MULTI_T];       // [SHARED_INTERMEDIATE]
     id<MTLBuffer> buf_shared_out_slot[MAX_MULTI_T];       // [HIDDEN_DIM]
-    // Per-slot expert buffers for concurrent CMD3 dispatch on per-slot queues.
-    // Without per-slot intermediates, concurrent CMD3s race on shared gate/up/act[k].
-    id<MTLBuffer> buf_multi_expert_out_slot[MAX_MULTI_T][MAX_K];  // [HIDDEN_DIM] each
-    id<MTLBuffer> buf_multi_expert_gate_slot[MAX_MULTI_T][MAX_K]; // [MOE_INTERMEDIATE] each
-    id<MTLBuffer> buf_multi_expert_up_slot[MAX_MULTI_T][MAX_K];   // [MOE_INTERMEDIATE] each
-    id<MTLBuffer> buf_multi_expert_act_slot[MAX_MULTI_T][MAX_K];  // [MOE_INTERMEDIATE] each
+    // Per-slot expert OUTPUT buffers (128 KB per slot × 3 extra slots = 384 KB)
+    // Expert DATA buffers (weights) are shared via malloc cache (read-only after population)
+    id<MTLBuffer> buf_multi_expert_out_slot[MAX_MULTI_T][MAX_K]; // [HIDDEN_DIM] each
 
     int multi_slot_initialized;  // 0 until init_multi_slot_bufs() is called
 } MetalCtx;
@@ -1504,12 +1501,8 @@ static MetalCtx *metal_setup(void) {
     ctx->buf_combine_params_slot[0] = ctx->buf_combine_params;
     ctx->buf_cmd3_sum_sq_slot[0] = ctx->buf_cmd3_sum_sq;
     ctx->buf_shared_out_slot[0] = ctx->buf_shared_out;
-    for (int k = 0; k < MAX_K; k++) {
+    for (int k = 0; k < MAX_K; k++)
         ctx->buf_multi_expert_out_slot[0][k] = ctx->buf_multi_expert_out[k];
-        ctx->buf_multi_expert_gate_slot[0][k] = ctx->buf_multi_expert_gate[k];
-        ctx->buf_multi_expert_up_slot[0][k] = ctx->buf_multi_expert_up[k];
-        ctx->buf_multi_expert_act_slot[0][k] = ctx->buf_multi_expert_act[k];
-    }
 
     printf("[metal] Inference pipelines ready (multi-expert[%d] + shared buffers allocated)\n", MAX_K);
     return ctx;
@@ -1549,12 +1542,8 @@ static void init_multi_slot_bufs(MetalCtx *ctx) {
     ctx->buf_shared_up_slot[0] = ctx->buf_shared_up;
     ctx->buf_shared_act_slot[0] = ctx->buf_shared_act;
     ctx->buf_shared_out_slot[0] = ctx->buf_shared_out;
-    for (int k = 0; k < MAX_K; k++) {
+    for (int k = 0; k < MAX_K; k++)
         ctx->buf_multi_expert_out_slot[0][k] = ctx->buf_multi_expert_out[k];
-        ctx->buf_multi_expert_gate_slot[0][k] = ctx->buf_multi_expert_gate[k];
-        ctx->buf_multi_expert_up_slot[0][k] = ctx->buf_multi_expert_up[k];
-        ctx->buf_multi_expert_act_slot[0][k] = ctx->buf_multi_expert_act[k];
-    }
 
     // Slots 1..MAX_MULTI_T-1 = fresh allocations
     size_t total_alloc = 0;
@@ -1601,11 +1590,8 @@ static void init_multi_slot_bufs(MetalCtx *ctx) {
         ctx->buf_shared_act_slot[t]    = NEWBUF(SHARED_INTERMEDIATE * sizeof(float));
         ctx->buf_shared_out_slot[t]    = NEWBUF(HIDDEN_DIM * sizeof(float));
         for (int k = 0; k < MAX_K; k++) {
-            ctx->buf_multi_expert_out_slot[t][k]  = NEWBUF(HIDDEN_DIM * sizeof(float));
-            ctx->buf_multi_expert_gate_slot[t][k] = NEWBUF(MOE_INTERMEDIATE * sizeof(float));
-            ctx->buf_multi_expert_up_slot[t][k]   = NEWBUF(MOE_INTERMEDIATE * sizeof(float));
-            ctx->buf_multi_expert_act_slot[t][k]  = NEWBUF(MOE_INTERMEDIATE * sizeof(float));
-            total_alloc += (HIDDEN_DIM + 3 * MOE_INTERMEDIATE) * sizeof(float);
+            ctx->buf_multi_expert_out_slot[t][k] = NEWBUF(HIDDEN_DIM * sizeof(float));
+            total_alloc += HIDDEN_DIM * sizeof(float);
         }
 
         total_alloc += (4*HIDDEN_DIM + 1 + q_dim*3 + (size_t)NUM_ATTN_HEADS*GPU_KV_SEQ
@@ -5306,116 +5292,6 @@ static void fused_layer_forward(
             }
 
             gpu_linear_attn = 1;
-
-            // ---- CMD1+CMD2 FUSION for linear layers ----
-            // Encode CMD2 work (o_proj + residual + norm + routing) INTO cmd1,
-            // eliminating a separate cmd_fused command buffer. This applies the
-            // ANE super-block fusion insight: fewer dispatch boundaries = less
-            // Metal overhead (~0.2 ms saved per linear layer × 45 layers = 9 ms).
-            //
-            // The residual is in buf_moe_hidden (from previous CMD3, which is
-            // on the same serial queue → already completed). GPU blit copies it
-            // to buf_residual so the residual_add encoder can read it.
-            if (prev_gpu_combined &&
-                lc->out_proj_w && lc->out_proj_s && lc->out_proj_b &&
-                g_metal->residual_add && g_metal->rms_norm_sum &&
-                g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w &&
-                lc->gate_w && lc->sg_w && lc->su_w && lc->seg_w) {
-
-                int oproj_in_dim_fused = LINEAR_TOTAL_VALUE;
-                static float s_shared_gate_score_fused = 0;
-
-                // Blit: buf_moe_hidden → buf_residual (GPU-side residual copy)
-                {
-                    id<MTLBlitCommandEncoder> blit = [cmd1 blitCommandEncoder];
-                    [blit copyFromBuffer:g_metal->buf_moe_hidden sourceOffset:0
-                                toBuffer:g_metal->buf_residual destinationOffset:0
-                                    size:HIDDEN_DIM * sizeof(float)];
-                    [blit endEncoding];
-                }
-
-                // o_proj (reads batch_out[6] from gated_rms_norm, writes buf_output)
-                {
-                    NSUInteger w_off = (NSUInteger)((const char *)lc->out_proj_w - (const char *)[g_metal->wf_buf contents]);
-                    NSUInteger s_off = (NSUInteger)((const char *)lc->out_proj_s - (const char *)[g_metal->wf_buf contents]);
-                    NSUInteger b_off = (NSUInteger)((const char *)lc->out_proj_b - (const char *)[g_metal->wf_buf contents]);
-                    id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                    uint32_t o_out = HIDDEN_DIM, o_in = (uint32_t)oproj_in_dim_fused, o_gs = GROUP_SIZE;
-                    [enc setComputePipelineState:g_metal->matvec_fast];
-                    [enc setBuffer:g_metal->wf_buf     offset:w_off atIndex:0];
-                    [enc setBuffer:g_metal->wf_buf     offset:s_off atIndex:1];
-                    [enc setBuffer:g_metal->wf_buf     offset:b_off atIndex:2];
-                    [enc setBuffer:g_metal->batch_out[6] offset:0   atIndex:3];
-                    [enc setBuffer:g_metal->buf_output offset:0     atIndex:4];
-                    [enc setBytes:&o_out length:4 atIndex:5];
-                    [enc setBytes:&o_in  length:4 atIndex:6];
-                    [enc setBytes:&o_gs  length:4 atIndex:7];
-                    [enc dispatchThreadgroups:MTLSizeMake(o_out, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-                    [enc endEncoding];
-                }
-
-                // residual_add (buf_output + buf_residual → buf_h_mid)
-                {
-                    id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                    uint32_t dim = HIDDEN_DIM;
-                    [enc setComputePipelineState:g_metal->residual_add];
-                    [enc setBuffer:g_metal->buf_residual offset:0 atIndex:0];
-                    [enc setBuffer:g_metal->buf_output   offset:0 atIndex:1];
-                    [enc setBuffer:g_metal->buf_h_mid    offset:0 atIndex:2];
-                    [enc setBytes:&dim length:4 atIndex:3];
-                    [enc dispatchThreadgroups:MTLSizeMake((dim + 255) / 256, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                    [enc endEncoding];
-                }
-
-                // rms_norm_sum (buf_h_mid → buf_sum_sq)
-                {
-                    id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                    uint32_t dim = HIDDEN_DIM;
-                    [enc setComputePipelineState:g_metal->rms_norm_sum];
-                    [enc setBuffer:g_metal->buf_h_mid  offset:0 atIndex:0];
-                    [enc setBuffer:g_metal->buf_sum_sq offset:0 atIndex:1];
-                    [enc setBytes:&dim length:4 atIndex:2];
-                    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                    [enc endEncoding];
-                }
-
-                // rms_norm_apply_bf16 (buf_h_mid + post_attn_norm_w → buf_input)
-                {
-                    NSUInteger norm_off = (NSUInteger)((const char *)lc->post_attn_norm_w -
-                                                       (const char *)[g_metal->wf_buf contents]);
-                    id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                    uint32_t dim = HIDDEN_DIM;
-                    float eps = RMS_NORM_EPS;
-                    [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
-                    [enc setBuffer:g_metal->buf_h_mid  offset:0       atIndex:0];
-                    [enc setBuffer:g_metal->wf_buf     offset:norm_off atIndex:1];
-                    [enc setBuffer:g_metal->buf_sum_sq offset:0       atIndex:2];
-                    [enc setBuffer:g_metal->buf_input  offset:0       atIndex:3];
-                    [enc setBytes:&dim length:4 atIndex:4];
-                    [enc setBytes:&eps length:4 atIndex:5];
-                    [enc dispatchThreadgroups:MTLSizeMake((dim + 255) / 256, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                    [enc endEncoding];
-                }
-
-                // routing + shared expert projections (read buf_input)
-                // Use static scratch for output (same as the cmd_fused path uses)
-                {
-                    BatchMatvecSpec moe_specs[4] = {
-                        { lc->gate_w, lc->gate_s, lc->gate_b, s_gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0 },
-                        { lc->sg_w,   lc->sg_s,   lc->sg_b,   s_shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1 },
-                        { lc->su_w,   lc->su_s,   lc->su_b,   s_shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2 },
-                        { lc->seg_w,  lc->seg_s,  lc->seg_b,  &s_shared_gate_score_fused, 1,                       HIDDEN_DIM, GROUP_SIZE, 3 },
-                    };
-                    gpu_encode_batch_matvec(g_metal, cmd1, moe_specs, 4);
-                }
-
-                // Mark that CMD1 now includes CMD2 work — skip cmd_fused later
-                gpu_linear_attn = 2;  // 2 = fully fused (CMD1 has CMD2 too)
-            }
         }
 
         [cmd1 commit];
@@ -6058,18 +5934,7 @@ static void fused_layer_forward(
     int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
                          && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
-    if (gpu_linear_attn == 2) {
-        // ---- CMD1+CMD2 already fused for this linear layer ----
-        // Just read back the results from GPU buffers to CPU scratch.
-        gpu_flush_batch_results(g_metal,
-            (BatchMatvecSpec[]){{ lc->gate_w, lc->gate_s, lc->gate_b, gate_scores, (uint32_t)NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE, 0 },
-                                { lc->sg_w, lc->sg_s, lc->sg_b, shared_gate, (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1 },
-                                { lc->su_w, lc->su_s, lc->su_b, shared_up, (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2 },
-                                { lc->seg_w, lc->seg_s, lc->seg_b, &shared_gate_score, 1, HIDDEN_DIM, GROUP_SIZE, 3 }}, 4);
-        memcpy(h_mid, [g_metal->buf_h_mid contents], HIDDEN_DIM * sizeof(float));
-        memcpy(h_post, [g_metal->buf_input contents], HIDDEN_DIM * sizeof(float));
-        memcpy(hidden, h_mid, HIDDEN_DIM * sizeof(float));
-    } else if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
+    if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
         g_metal && g_metal->wf_buf && have_moe_weights &&
         g_metal->residual_add && g_metal->rms_norm_sum &&
         g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w) {
@@ -9226,14 +9091,39 @@ static void multi_slot_full_attn_layer(
         cmd1s[t] = [ctx->queue_slot[t] commandBuffer];
 
         if (!prev_gpu_combined) {
-            // ---- No pending CMD3: CPU fp32 norm (matches serial slow-path) ----
+            // No pending CMD3 — copy hidden to buf_input + GPU norm
             float *hidden_t = hidden_batch + (size_t)t * HIDDEN_DIM;
-            float *norm_dst = (float *)[ctx->buf_input_slot[t] contents];
-            cpu_rms_norm(hidden_t, lc->input_norm_w, norm_dst, HIDDEN_DIM, RMS_NORM_EPS);
+            memcpy([ctx->buf_input_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
             memcpy([ctx->buf_residual_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
+
+            // GPU norm: rms_norm_sum + rms_norm_apply_bf16 in-place
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd1s[t] computeCommandEncoder];
+                uint32_t dim = HIDDEN_DIM;
+                [enc setComputePipelineState:ctx->rms_norm_sum];
+                [enc setBuffer:ctx->buf_input_slot[t]  offset:0 atIndex:0];
+                [enc setBuffer:ctx->buf_sum_sq_slot[t] offset:0 atIndex:1];
+                [enc setBytes:&dim length:4 atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            {
+                NSUInteger norm_off = (NSUInteger)((const char *)lc->input_norm_w - (const char *)[ctx->wf_buf contents]);
+                id<MTLComputeCommandEncoder> enc = [cmd1s[t] computeCommandEncoder];
+                uint32_t dim = HIDDEN_DIM; float eps = RMS_NORM_EPS;
+                [enc setComputePipelineState:ctx->rms_norm_apply_bf16];
+                [enc setBuffer:ctx->buf_input_slot[t]  offset:0        atIndex:0];
+                [enc setBuffer:ctx->wf_buf             offset:norm_off atIndex:1];
+                [enc setBuffer:ctx->buf_sum_sq_slot[t] offset:0        atIndex:2];
+                [enc setBuffer:ctx->buf_input_slot[t]  offset:0        atIndex:3];
+                [enc setBytes:&dim length:4 atIndex:4];
+                [enc setBytes:&eps length:4 atIndex:5];
+                [enc dispatchThreadgroups:MTLSizeMake((dim+255)/256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
         }
-        // When prev_gpu_combined: buf_input_slot[t] already GPU-normed by CMD3
-        // (matches serial fast-path). CMD1 auto-waits for CMD3.
+        // When prev_gpu_combined: buf_input_slot[t] already GPU-normed by CMD3.
+        // CMD1 on queue_slot[t] auto-waits for CMD3 via Metal serial queue.
 
         SlotFullAttnBufs sb = get_slot_bufs_from_ctx(ctx, t);
         encode_slot_cmd1_proj(cmd1s[t], &sb, lc);
@@ -9487,23 +9377,42 @@ static void multi_slot_linear_attn_layer(
         cmd1s[t] = [ctx->queue_slot[t] commandBuffer];
 
         if (!prev_gpu_combined) {
-            // ---- CPU fp32 norm (matches serial slow-path) ----
-            // CRITICAL: wait for any pending CMD3 on this slot before writing to
-            // buf_input_slot[t]. After a serial-fallback layer, CMD3 from
-            // fused_layer_forward may still be running on queue_slot[t] and writing
-            // to buf_input_slot[t]. CPU memcpy without waiting = data race = garbage.
-            if (deferred_slot_active(t)) {
-                complete_deferred_slot(t);
-            }
+            // ---- No pending CMD3: copy hidden → buf_input + GPU norm ----
             float *hidden_t = hidden_batch + (size_t)t * HIDDEN_DIM;
-            float *norm_dst = (float *)[ctx->buf_input_slot[t] contents];
-            cpu_rms_norm(hidden_t, lc->input_norm_w, norm_dst, HIDDEN_DIM, RMS_NORM_EPS);
+            memcpy([ctx->buf_input_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
             memcpy([ctx->buf_residual_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
+
+            // GPU norm: rms_norm_sum + rms_norm_apply_bf16 (in-place on buf_input_slot[t])
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd1s[t] computeCommandEncoder];
+                uint32_t dim = HIDDEN_DIM;
+                [enc setComputePipelineState:ctx->rms_norm_sum];
+                [enc setBuffer:ctx->buf_input_slot[t]  offset:0 atIndex:0];
+                [enc setBuffer:ctx->buf_sum_sq_slot[t] offset:0 atIndex:1];
+                [enc setBytes:&dim length:4 atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            {
+                NSUInteger norm_off = (NSUInteger)((const char *)lc->input_norm_w - (const char *)[ctx->wf_buf contents]);
+                id<MTLComputeCommandEncoder> enc = [cmd1s[t] computeCommandEncoder];
+                uint32_t dim = HIDDEN_DIM; float eps = RMS_NORM_EPS;
+                [enc setComputePipelineState:ctx->rms_norm_apply_bf16];
+                [enc setBuffer:ctx->buf_input_slot[t]  offset:0        atIndex:0];
+                [enc setBuffer:ctx->wf_buf             offset:norm_off atIndex:1];
+                [enc setBuffer:ctx->buf_sum_sq_slot[t] offset:0        atIndex:2];
+                [enc setBuffer:ctx->buf_input_slot[t]  offset:0        atIndex:3];
+                [enc setBytes:&dim length:4 atIndex:4];
+                [enc setBytes:&eps length:4 atIndex:5];
+                [enc dispatchThreadgroups:MTLSizeMake((dim+255)/256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
         }
         // When prev_gpu_combined: buf_input_slot[t] already has GPU-normed input
-        // from CMD3 (matches serial fast-path). CMD1 auto-waits for CMD3.
+        // from CMD3. CMD1 on queue_slot[t] auto-waits for CMD3 to complete.
+        // No norm encoders needed — just dispatch projections directly.
 
-        // Encode 4 projection matvecs using buf_input_slot[t]
+        // Encode 4 projection matvecs using buf_input_slot[t] (GPU-normed or fresh)
         #define ENC_LA_MV(W, S_, B, OUT_SLOT, OUT_DIM) do { \
             NSUInteger w_off = (NSUInteger)((const char *)(W)  - (const char *)[ctx->wf_buf contents]); \
             NSUInteger s_off = (NSUInteger)((const char *)(S_) - (const char *)[ctx->wf_buf contents]); \
@@ -9746,26 +9655,32 @@ static void multi_slot_expert_dispatch_batched(
         float *hidden_t = hidden_batch + (size_t)t * HIDDEN_DIM;
         float *expert_out_t = expert_out_batch + (size_t)t * HIDDEN_DIM;
 
+        // Copy shared expert gate/up from per-slot to shared buffers
+        memcpy([ctx->buf_shared_gate contents],
+               [ctx->buf_shared_gate_slot[t] contents], SHARED_INTERMEDIATE * sizeof(float));
+        memcpy([ctx->buf_shared_up contents],
+               [ctx->buf_shared_up_slot[t] contents], SHARED_INTERMEDIATE * sizeof(float));
+
         // Copy h_mid to buf_h_mid_slot[t] for GPU combine
         memcpy([ctx->buf_h_mid_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
 
         // Copy expert_out to per-slot expert output buf for GPU combine
+        // (moe_combine_residual reads from buf_multi_expert_out_slot[t])
+        // We have the CPU-accumulated expert_out_t — copy it to ONE expert output slot
+        // and set weight=1.0 for that slot (the accumulation already applied gate weights)
         memcpy([ctx->buf_multi_expert_out_slot[t][0] contents],
                expert_out_t, HIDDEN_DIM * sizeof(float));
 
         // GPU CMD3: shared SwiGLU + down + combine + norm → async on queue_slot[t]
-        // CRITICAL: ALL buffers must be PER-SLOT. Concurrent CMD3s on different
-        // queue_slot[t] writing to shared buffers = data race = garbage output.
-        // This was the root cause of T>1 correctness failure.
         id<MTLCommandBuffer> cmd3 = [ctx->queue_slot[t] commandBuffer];
 
-        // Shared SwiGLU (per-slot buffers)
+        // Shared SwiGLU
         {
             id<MTLComputeCommandEncoder> enc = [cmd3 computeCommandEncoder];
             [enc setComputePipelineState:ctx->swiglu];
-            [enc setBuffer:ctx->buf_shared_gate_slot[t] offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_shared_up_slot[t]   offset:0 atIndex:1];
-            [enc setBuffer:ctx->buf_shared_act_slot[t]  offset:0 atIndex:2];
+            [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_shared_up   offset:0 atIndex:1];
+            [enc setBuffer:ctx->buf_shared_act  offset:0 atIndex:2];
             uint32_t dim = SHARED_INTERMEDIATE;
             [enc setBytes:&dim length:4 atIndex:3];
             [enc dispatchThreadgroups:MTLSizeMake((dim + 255) / 256, 1, 1)
@@ -9773,11 +9688,11 @@ static void multi_slot_expert_dispatch_batched(
             [enc endEncoding];
         }
 
-        // Shared down_proj (per-slot in/out)
+        // Shared down_proj
         if (lc->sd_w && lc->sd_s && lc->sd_b) {
             gpu_encode_dequant_matvec_with_io_bufs(
                 ctx, cmd3, lc->sd_w, lc->sd_s, lc->sd_b,
-                ctx->buf_shared_act_slot[t], ctx->buf_shared_out_slot[t],
+                ctx->buf_shared_act, ctx->buf_shared_out,
                 HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
         }
 
@@ -9801,7 +9716,7 @@ static void multi_slot_expert_dispatch_batched(
                 id<MTLComputeCommandEncoder> enc = [cmd3 computeCommandEncoder];
                 [enc setComputePipelineState:ctx->moe_combine_residual];
                 [enc setBuffer:ctx->buf_h_mid_slot[t]      offset:0 atIndex:0];
-                [enc setBuffer:ctx->buf_shared_out_slot[t] offset:0 atIndex:1];
+                [enc setBuffer:ctx->buf_shared_out         offset:0 atIndex:1];
                 [enc setBuffer:ctx->buf_moe_hidden_slot[t] offset:0 atIndex:2];
                 for (int k = 0; k < MAX_K; k++) {
                     [enc setBuffer:ctx->buf_multi_expert_out_slot[t][k] offset:0 atIndex:(3 + k)];
@@ -9890,13 +9805,9 @@ static void multi_slot_expert_dispatch_token(
 
     int actual_K = (K > MAX_K) ? MAX_K : K;
 
-    // Swap buf_multi_expert_input to point at the PER-SLOT buf_input_slot[t]
-    // which already contains h_post. Metal captures the buffer reference at
-    // ENCODE time (not commit time), so the GPU reads from the per-slot buffer
-    // even after we swap the pointer back for the next token.
-    // This avoids the shared-buffer race without needing synchronous dispatch.
-    id<MTLBuffer> saved_expert_input = ctx->buf_multi_expert_input;
-    ctx->buf_multi_expert_input = ctx->buf_input_slot[t];
+    // Read h_post from buf_input_slot[t] → shared buf_multi_expert_input
+    memcpy([ctx->buf_multi_expert_input contents],
+           [ctx->buf_input_slot[t] contents], HIDDEN_DIM * sizeof(float));
 
     // Copy shared expert gate/up from per-slot to shared buffers
     memcpy([ctx->buf_shared_gate contents],
@@ -9972,34 +9883,20 @@ static void multi_slot_expert_dispatch_token(
     memcpy([ctx->buf_h_mid_slot[t] contents], hidden, HIDDEN_DIM * sizeof(float));
 
     // GPU CMD3 on PER-SLOT QUEUE — critical for CMD3→CMD1 pipeline overlap.
+    // When CMD3 is on queue_slot[t], the NEXT layer's CMD1 (also on queue_slot[t])
+    // auto-waits for CMD3 to complete via Metal's serial queue ordering.
     id<MTLCommandBuffer> cmd3 = [ctx->queue_slot[t] commandBuffer];
 
-    // Swap ALL expert intermediate buffers to per-slot BEFORE encoding CMD3.
-    // Metal captures buffer refs at ENCODE time. After commit, we restore the
-    // shared pointers for the next token. This prevents data races when
-    // concurrent CMD3s on different queues write to the same intermediates.
-    id<MTLBuffer> saved_gate[MAX_K], saved_up[MAX_K], saved_act[MAX_K], saved_out[MAX_K];
-    for (int k = 0; k < MAX_K; k++) {
-        saved_gate[k] = ctx->buf_multi_expert_gate[k];
-        saved_up[k]   = ctx->buf_multi_expert_up[k];
-        saved_act[k]  = ctx->buf_multi_expert_act[k];
-        saved_out[k]  = ctx->buf_multi_expert_out[k];
-        ctx->buf_multi_expert_gate[k] = ctx->buf_multi_expert_gate_slot[t][k];
-        ctx->buf_multi_expert_up[k]   = ctx->buf_multi_expert_up_slot[t][k];
-        ctx->buf_multi_expert_act[k]  = ctx->buf_multi_expert_act_slot[t][k];
-        ctx->buf_multi_expert_out[k]  = ctx->buf_multi_expert_out_slot[t][k];
-    }
-
-    // Expert forwards (batched encoding — reads per-slot intermediates)
+    // Expert forwards (batched encoding)
     gpu_encode_experts_batched(ctx, cmd3, actual_K, valid, expert_bufs);
 
-    // Shared SwiGLU (PER-SLOT buffers — concurrent CMD3s on different queues)
+    // Shared SwiGLU
     {
         id<MTLComputeCommandEncoder> enc = [cmd3 computeCommandEncoder];
         [enc setComputePipelineState:ctx->swiglu];
-        [enc setBuffer:ctx->buf_shared_gate_slot[t] offset:0 atIndex:0];
-        [enc setBuffer:ctx->buf_shared_up_slot[t]   offset:0 atIndex:1];
-        [enc setBuffer:ctx->buf_shared_act_slot[t]  offset:0 atIndex:2];
+        [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_shared_up   offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_shared_act  offset:0 atIndex:2];
         uint32_t dim = SHARED_INTERMEDIATE;
         [enc setBytes:&dim length:4 atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake((dim + 255) / 256, 1, 1)
@@ -10007,17 +9904,17 @@ static void multi_slot_expert_dispatch_token(
         [enc endEncoding];
     }
 
-    // Shared down_proj (per-slot in/out)
+    // Shared down_proj
     if (lc->sd_w && lc->sd_s && lc->sd_b) {
         gpu_encode_dequant_matvec_with_io_bufs(
             ctx, cmd3, lc->sd_w, lc->sd_s, lc->sd_b,
-            ctx->buf_shared_act_slot[t], ctx->buf_shared_out_slot[t],
+            ctx->buf_shared_act, ctx->buf_shared_out,
             HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
     }
 
-    // GPU combine (per-slot buffers throughout)
+    // GPU combine: moe_combine_residual
     if (ctx->moe_combine_residual) {
-        float *params = (float *)[ctx->buf_combine_params_slot[t] contents];
+        float *params = (float *)[ctx->buf_combine_params contents];
         memset(params, 0, 10 * sizeof(float));
         for (int k = 0; k < actual_K; k++) {
             params[k] = valid[k] ? expert_weights[k] : 0.0f;
@@ -10026,13 +9923,13 @@ static void multi_slot_expert_dispatch_token(
 
         id<MTLComputeCommandEncoder> enc = [cmd3 computeCommandEncoder];
         [enc setComputePipelineState:ctx->moe_combine_residual];
-        [enc setBuffer:ctx->buf_h_mid_slot[t]           offset:0 atIndex:0];
-        [enc setBuffer:ctx->buf_shared_out_slot[t]      offset:0 atIndex:1];
-        [enc setBuffer:ctx->buf_moe_hidden_slot[t]      offset:0 atIndex:2];
+        [enc setBuffer:ctx->buf_h_mid      offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_shared_out offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:2];
         for (int k = 0; k < MAX_K; k++) {
-            [enc setBuffer:ctx->buf_multi_expert_out_slot[t][k] offset:0 atIndex:(3 + k)];
+            [enc setBuffer:ctx->buf_multi_expert_out[k] offset:0 atIndex:(3 + k)];
         }
-        [enc setBuffer:ctx->buf_combine_params_slot[t] offset:0 atIndex:11];
+        [enc setBuffer:ctx->buf_combine_params offset:0 atIndex:11];
         uint32_t dim = HIDDEN_DIM;
         uint32_t k_val = (uint32_t)actual_K;
         [enc setBytes:&dim   length:4 atIndex:12];
@@ -10130,18 +10027,10 @@ static void multi_slot_expert_dispatch_token(
         [enc endEncoding];
     }
 
-    // Dispatch CMD3 ASYNC on per-slot queue — ALL per-slot buffers are now
-    // correctly swapped, so concurrent CMD3s on different queues don't race.
+    // ---- ASYNC dispatch on per-slot queue (restores CMD3→CMD1 pipeline) ----
     [cmd3 commit];
-
-    // Restore all swapped pointers (next token will swap to its own per-slot)
-    ctx->buf_multi_expert_input = saved_expert_input;
-    for (int k = 0; k < MAX_K; k++) {
-        ctx->buf_multi_expert_gate[k] = saved_gate[k];
-        ctx->buf_multi_expert_up[k]   = saved_up[k];
-        ctx->buf_multi_expert_act[k]  = saved_act[k];
-        ctx->buf_multi_expert_out[k]  = saved_out[k];
-    }
+    // DO NOT wait — CMD3 runs async on queue_slot[t].
+    // The NEXT layer's CMD1 on queue_slot[t] will auto-wait for CMD3 to complete.
 
     // Store deferred state for finalization at the start of the next layer
     g_current_slot = t;
@@ -10201,16 +10090,11 @@ static void multi_slot_prefill_chunk(
         // The finalize (wait + readback) happens INSIDE the layer drivers AFTER
         // CMD1 is dispatched on queue_slot[t]. Metal's serial queue guarantees
         // CMD3 completes before CMD1 starts — this is the pipeline overlap.
-        // Check if ALL slots have GPU-combined deferred CMD3 from previous layer.
-        // Only skip norm if EVERY slot has GPU-prepared buf_input_slot[t].
-        // After a serial fallback (which only processes slot 0), slots 1..T-1
-        // have stale data — must NOT skip norm for those.
-        int prev_gpu = 1;
         for (int t = 0; t < T; t++) {
             gpu_input_ready[t] = deferred_slot_active(t) ?
                 g_deferred_slots[t].gpu_combined : 0;
-            if (!gpu_input_ready[t]) prev_gpu = 0;
         }
+        int prev_gpu = gpu_input_ready[0];  // all slots progress together
 
         // ---- Step 1: Multi-slot attention + routing ----
         // Pass prev_gpu to layer drivers so they skip input norm when GPU-combined
@@ -10222,16 +10106,7 @@ static void multi_slot_prefill_chunk(
             if (kv && kv->len >= 1 && g_metal->attn_scores_pipe) {
                 multi_slot_full_attn_layer(wf, layer, hidden_chunk, T, kv, pos_start, prev_gpu);
             } else {
-                // Fallback: serial per-token.
-                // CRITICAL: finalize ALL slots' pending CMD3s first — if a previous
-                // multi-slot layer dispatched CMD3 on queue_slot[1..T-1], those
-                // CMD3s are still pending. The serial fallback only handles slot 0.
-                // Without this, pending CMD3s corrupt per-slot buffers in background.
-                for (int t = 0; t < T; t++) {
-                    if (deferred_slot_active(t)) {
-                        complete_deferred_slot(t);
-                    }
-                }
+                // Fallback: serial per-token
                 for (int t = 0; t < T; t++) {
                     g_current_slot = 0;
                     if (g_deferred.active) complete_deferred_experts();
@@ -10249,12 +10124,6 @@ static void multi_slot_prefill_chunk(
             if (la && g_metal->delta_net_step && g_metal->conv1d_step) {
                 multi_slot_linear_attn_layer(wf, layer, hidden_chunk, T, la, pos_start, prev_gpu);
             } else {
-                // Same critical fix: finalize all pending deferred slots
-                for (int t = 0; t < T; t++) {
-                    if (deferred_slot_active(t)) {
-                        complete_deferred_slot(t);
-                    }
-                }
                 for (int t = 0; t < T; t++) {
                     g_current_slot = 0;
                     if (g_deferred.active) complete_deferred_experts();
@@ -10271,10 +10140,11 @@ static void multi_slot_prefill_chunk(
 
         double t_attn_done = now_ms();
 
-        // ---- Step 2: Expert dispatch per token — ALL ASYNC on per-slot queues ----
-        // Per-slot intermediate buffers (gate/up/act/out/shared/input) are all
-        // swapped inside multi_slot_expert_dispatch_token, so concurrent CMD3s
-        // on different queue_slot[t] don't race on any buffer.
+        // ---- Step 2: Expert dispatch per token — ASYNC on per-slot queues ----
+        // Per-token dispatch with malloc cache is faster than batched
+        // dispatch_experts_sparse (which doesn't use the cache and does
+        // synchronous gpu_expert_forward per pair). Each token's CMD3
+        // goes on queue_slot[t] for pipeline overlap with next layer.
         for (int t = 0; t < T; t++) {
             multi_slot_expert_dispatch_token(
                 layer,
@@ -10295,7 +10165,7 @@ static void multi_slot_prefill_chunk(
         sum_expert += (t_expert_done - t_attn_done);
         if (layer == NUM_LAYERS - 1) {
             chunk_count++;
-            if (ms_dbg) {
+            if (ms_dbg || chunk_count <= 10 || chunk_count % 5 == 0) {
                 fprintf(stderr, "[MS-CHUNK] chunk=%d sum_attn=%.1f sum_expert=%.1f total=%.1f ms (%.1f ms/tok at T=%d)\n",
                         chunk_count, sum_attn, sum_expert, sum_attn + sum_expert,
                         (sum_attn + sum_expert) / T, T);
@@ -11316,18 +11186,11 @@ int main(int argc, char **argv) {
 
             // Check MULTI_SLOT_PREFILL env var (once)
             if (g_multi_slot_prefill_enabled < 0) {
-                // Default ON when batch_prefill_T > 1 and malloc cache is active.
-                // Disable with MULTI_SLOT_PREFILL=0 for comparison benchmarks.
                 const char *ms = getenv("MULTI_SLOT_PREFILL");
-                if (ms) {
-                    g_multi_slot_prefill_enabled = (ms[0] == '1') ? 1 : 0;
-                } else {
-                    // Auto-enable when using malloc cache (the production config)
-                    g_multi_slot_prefill_enabled = (g_malloc_cache != NULL) ? 1 : 0;
-                }
+                g_multi_slot_prefill_enabled = (ms && ms[0] == '1') ? 1 : 0;
                 if (g_multi_slot_prefill_enabled) {
-                    fprintf(stderr, "[multi-slot] multi-slot prefill enabled "
-                            "(parallel projections + deferred pipeline)\n");
+                    fprintf(stderr, "[multi-slot] MULTI_SLOT_PREFILL=1: using Phase 2 "
+                            "multi-slot prefill with parallel projections\n");
                 }
             }
 
