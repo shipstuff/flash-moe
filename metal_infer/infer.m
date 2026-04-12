@@ -1123,9 +1123,12 @@ typedef struct {
     id<MTLBuffer> buf_shared_up_slot[MAX_MULTI_T];        // [SHARED_INTERMEDIATE]
     id<MTLBuffer> buf_shared_act_slot[MAX_MULTI_T];       // [SHARED_INTERMEDIATE]
     id<MTLBuffer> buf_shared_out_slot[MAX_MULTI_T];       // [HIDDEN_DIM]
-    // Per-slot expert OUTPUT buffers (128 KB per slot × 3 extra slots = 384 KB)
-    // Expert DATA buffers (weights) are shared via malloc cache (read-only after population)
-    id<MTLBuffer> buf_multi_expert_out_slot[MAX_MULTI_T][MAX_K]; // [HIDDEN_DIM] each
+    // Per-slot expert buffers for concurrent CMD3 dispatch on per-slot queues.
+    // Without per-slot intermediates, concurrent CMD3s race on shared gate/up/act[k].
+    id<MTLBuffer> buf_multi_expert_out_slot[MAX_MULTI_T][MAX_K];  // [HIDDEN_DIM] each
+    id<MTLBuffer> buf_multi_expert_gate_slot[MAX_MULTI_T][MAX_K]; // [MOE_INTERMEDIATE] each
+    id<MTLBuffer> buf_multi_expert_up_slot[MAX_MULTI_T][MAX_K];   // [MOE_INTERMEDIATE] each
+    id<MTLBuffer> buf_multi_expert_act_slot[MAX_MULTI_T][MAX_K];  // [MOE_INTERMEDIATE] each
 
     int multi_slot_initialized;  // 0 until init_multi_slot_bufs() is called
 } MetalCtx;
@@ -1501,8 +1504,12 @@ static MetalCtx *metal_setup(void) {
     ctx->buf_combine_params_slot[0] = ctx->buf_combine_params;
     ctx->buf_cmd3_sum_sq_slot[0] = ctx->buf_cmd3_sum_sq;
     ctx->buf_shared_out_slot[0] = ctx->buf_shared_out;
-    for (int k = 0; k < MAX_K; k++)
+    for (int k = 0; k < MAX_K; k++) {
         ctx->buf_multi_expert_out_slot[0][k] = ctx->buf_multi_expert_out[k];
+        ctx->buf_multi_expert_gate_slot[0][k] = ctx->buf_multi_expert_gate[k];
+        ctx->buf_multi_expert_up_slot[0][k] = ctx->buf_multi_expert_up[k];
+        ctx->buf_multi_expert_act_slot[0][k] = ctx->buf_multi_expert_act[k];
+    }
 
     printf("[metal] Inference pipelines ready (multi-expert[%d] + shared buffers allocated)\n", MAX_K);
     return ctx;
@@ -1542,8 +1549,12 @@ static void init_multi_slot_bufs(MetalCtx *ctx) {
     ctx->buf_shared_up_slot[0] = ctx->buf_shared_up;
     ctx->buf_shared_act_slot[0] = ctx->buf_shared_act;
     ctx->buf_shared_out_slot[0] = ctx->buf_shared_out;
-    for (int k = 0; k < MAX_K; k++)
+    for (int k = 0; k < MAX_K; k++) {
         ctx->buf_multi_expert_out_slot[0][k] = ctx->buf_multi_expert_out[k];
+        ctx->buf_multi_expert_gate_slot[0][k] = ctx->buf_multi_expert_gate[k];
+        ctx->buf_multi_expert_up_slot[0][k] = ctx->buf_multi_expert_up[k];
+        ctx->buf_multi_expert_act_slot[0][k] = ctx->buf_multi_expert_act[k];
+    }
 
     // Slots 1..MAX_MULTI_T-1 = fresh allocations
     size_t total_alloc = 0;
@@ -1590,8 +1601,11 @@ static void init_multi_slot_bufs(MetalCtx *ctx) {
         ctx->buf_shared_act_slot[t]    = NEWBUF(SHARED_INTERMEDIATE * sizeof(float));
         ctx->buf_shared_out_slot[t]    = NEWBUF(HIDDEN_DIM * sizeof(float));
         for (int k = 0; k < MAX_K; k++) {
-            ctx->buf_multi_expert_out_slot[t][k] = NEWBUF(HIDDEN_DIM * sizeof(float));
-            total_alloc += HIDDEN_DIM * sizeof(float);
+            ctx->buf_multi_expert_out_slot[t][k]  = NEWBUF(HIDDEN_DIM * sizeof(float));
+            ctx->buf_multi_expert_gate_slot[t][k] = NEWBUF(MOE_INTERMEDIATE * sizeof(float));
+            ctx->buf_multi_expert_up_slot[t][k]   = NEWBUF(MOE_INTERMEDIATE * sizeof(float));
+            ctx->buf_multi_expert_act_slot[t][k]  = NEWBUF(MOE_INTERMEDIATE * sizeof(float));
+            total_alloc += (HIDDEN_DIM + 3 * MOE_INTERMEDIATE) * sizeof(float);
         }
 
         total_alloc += (4*HIDDEN_DIM + 1 + q_dim*3 + (size_t)NUM_ATTN_HEADS*GPU_KV_SEQ
@@ -9837,11 +9851,25 @@ static void multi_slot_expert_dispatch_token(
     memcpy([ctx->buf_h_mid_slot[t] contents], hidden, HIDDEN_DIM * sizeof(float));
 
     // GPU CMD3 on PER-SLOT QUEUE — critical for CMD3→CMD1 pipeline overlap.
-    // When CMD3 is on queue_slot[t], the NEXT layer's CMD1 (also on queue_slot[t])
-    // auto-waits for CMD3 to complete via Metal's serial queue ordering.
     id<MTLCommandBuffer> cmd3 = [ctx->queue_slot[t] commandBuffer];
 
-    // Expert forwards (batched encoding)
+    // Swap ALL expert intermediate buffers to per-slot BEFORE encoding CMD3.
+    // Metal captures buffer refs at ENCODE time. After commit, we restore the
+    // shared pointers for the next token. This prevents data races when
+    // concurrent CMD3s on different queues write to the same intermediates.
+    id<MTLBuffer> saved_gate[MAX_K], saved_up[MAX_K], saved_act[MAX_K], saved_out[MAX_K];
+    for (int k = 0; k < MAX_K; k++) {
+        saved_gate[k] = ctx->buf_multi_expert_gate[k];
+        saved_up[k]   = ctx->buf_multi_expert_up[k];
+        saved_act[k]  = ctx->buf_multi_expert_act[k];
+        saved_out[k]  = ctx->buf_multi_expert_out[k];
+        ctx->buf_multi_expert_gate[k] = ctx->buf_multi_expert_gate_slot[t][k];
+        ctx->buf_multi_expert_up[k]   = ctx->buf_multi_expert_up_slot[t][k];
+        ctx->buf_multi_expert_act[k]  = ctx->buf_multi_expert_act_slot[t][k];
+        ctx->buf_multi_expert_out[k]  = ctx->buf_multi_expert_out_slot[t][k];
+    }
+
+    // Expert forwards (batched encoding — reads per-slot intermediates)
     gpu_encode_experts_batched(ctx, cmd3, actual_K, valid, expert_bufs);
 
     // Shared SwiGLU (PER-SLOT buffers — concurrent CMD3s on different queues)
@@ -9981,14 +10009,18 @@ static void multi_slot_expert_dispatch_token(
         [enc endEncoding];
     }
 
-    // Dispatch CMD3. The last token in the chunk uses ASYNC dispatch on
-    // queue_slot[t] for pipeline overlap with the next layer's CMD1.
-    // All OTHER tokens use SYNC dispatch on the main queue to prevent
-    // shared intermediate buffer races (buf_multi_expert_gate/up/act[k]
-    // and buf_multi_expert_data[k] are shared across concurrent CMD3s).
+    // Dispatch CMD3 ASYNC on per-slot queue — ALL per-slot buffers are now
+    // correctly swapped, so concurrent CMD3s on different queues don't race.
     [cmd3 commit];
-    // Restore shared expert_input pointer
+
+    // Restore all swapped pointers (next token will swap to its own per-slot)
     ctx->buf_multi_expert_input = saved_expert_input;
+    for (int k = 0; k < MAX_K; k++) {
+        ctx->buf_multi_expert_gate[k] = saved_gate[k];
+        ctx->buf_multi_expert_up[k]   = saved_up[k];
+        ctx->buf_multi_expert_act[k]  = saved_act[k];
+        ctx->buf_multi_expert_out[k]  = saved_out[k];
+    }
 
     // Store deferred state for finalization at the start of the next layer
     g_current_slot = t;
@@ -10118,22 +10150,16 @@ static void multi_slot_prefill_chunk(
 
         double t_attn_done = now_ms();
 
-        // ---- Step 2: Expert dispatch per token ----
-        // Non-last tokens: SYNC dispatch (wait for CMD3) to prevent shared
-        // intermediate buffer races (buf_multi_expert_gate/up/act/data[k]).
-        // Last token: ASYNC (deferred) on queue_slot[T-1] for CMD3→CMD1
-        // pipeline overlap with the next layer.
+        // ---- Step 2: Expert dispatch per token — ALL ASYNC on per-slot queues ----
+        // Per-slot intermediate buffers (gate/up/act/out/shared/input) are all
+        // swapped inside multi_slot_expert_dispatch_token, so concurrent CMD3s
+        // on different queue_slot[t] don't race on any buffer.
         for (int t = 0; t < T; t++) {
             multi_slot_expert_dispatch_token(
                 layer,
                 hidden_chunk + (size_t)t * HIDDEN_DIM,
                 t, K, layer_fds[layer],
                 layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL);
-            // Wait for non-last tokens to prevent buffer races
-            if (t < T - 1 && deferred_slot_active(t)) {
-                complete_deferred_slot(t);
-            }
-            // Last token stays deferred for pipeline overlap
         }
 
         double t_expert_done = now_ms();
