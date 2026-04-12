@@ -986,6 +986,7 @@ typedef struct {
     id<MTLComputePipelineState> sigmoid_gate_pipe;
     id<MTLComputePipelineState> fullattn_norm_rope_pipe; // GPU RoPE+norm for CMD1+CMD2 fusion
     id<MTLComputePipelineState> fused_flash_attn_pipe;  // fused flash-attention with fp16 KV
+    id<MTLComputePipelineState> tq_rotate_q_pipe;       // GPU Q × Pi^T rotation for TQ CMD1 fusion
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [HIDDEN_DIM or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
@@ -1216,8 +1217,10 @@ static MetalCtx *metal_setup(void) {
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
     ctx->fullattn_norm_rope_pipe = makePipe(@"fullattn_norm_rope_kv");
     ctx->fused_flash_attn_pipe = makePipe(@"fused_flash_attention_fp16");
+    ctx->tq_rotate_q_pipe = makePipe(@"tq_rotate_q");
     if (ctx->fullattn_norm_rope_pipe) printf("[metal] GPU RoPE+norm kernel ready (CMD1+CMD2 fusion for full-attn)\n");
     if (ctx->fused_flash_attn_pipe) printf("[metal] Fused flash-attention (fp16 KV) ready\n");
+    if (ctx->tq_rotate_q_pipe) printf("[metal] GPU Q rotation ready (TQ CMD1 fusion)\n");
     ctx->tq_fused_attn_pipe  = makePipe(@"tq_fused_attention");
     ctx->tq_encode_pipe      = makePipe(@"tq_encode_packed");
     ctx->tq_pack_update_pipe  = makePipe(@"tq_pack_update");
@@ -5263,10 +5266,13 @@ static void fused_layer_forward(
         gpu_encode_batch_matvec(g_metal, cmd1, attn_specs, num_attn_specs);
 
         // GPU full-attention CMD1+CMD2 fusion: encode norm+RoPE+attention+post-attn into CMD1
-        // Excludes TQ path (TQ uses its own fused attention kernel in cmd_fused)
+        // Supports both non-TQ (fused flash-attention fp16) and TQ (tq_fused_attention)
+        int tq_fullattn = (g_metal->use_tq_kv && g_metal->tq_fused_attn_pipe &&
+                           g_metal->tq_pack_update_pipe && g_metal->tq_rotate_q_pipe &&
+                           g_metal->buf_tq_encode_k && g_metal->buf_tq_encode_v);
         if (is_full && !can_gpu_linear && prev_gpu_combined && num_attn_specs == 3 &&
-            g_metal->fullattn_norm_rope_pipe && g_metal->attn_scores_pipe &&
-            !g_metal->use_tq_kv &&
+            g_metal->fullattn_norm_rope_pipe &&
+            (tq_fullattn || g_metal->attn_scores_pipe) &&
             kv && kv->len >= 32 && kv->len < GPU_KV_SEQ &&
             lc->q_norm_w && lc->k_norm_w &&
             lc->o_w && lc->o_s && lc->o_b &&
@@ -5308,34 +5314,114 @@ static void fused_layer_forward(
                 [enc setBuffer:g_metal->wf_buf               offset:kn_off atIndex:4];  // k_norm_w bf16
                 [enc setBuffer:g_metal->buf_attn_q           offset:0      atIndex:5];  // out: attn_q
                 [enc setBuffer:g_metal->buf_attn_gate        offset:0      atIndex:6];  // out: attn_gate
-                [enc setBuffer:g_metal->buf_kv_k[fa_idx]     offset:0      atIndex:7];  // out: KV cache K
-                [enc setBuffer:g_metal->buf_kv_v[fa_idx]     offset:0      atIndex:8];  // out: KV cache V
+                if (tq_fullattn) {
+                    // TQ: write K/V to TQ encode scratch (at cache_pos=0)
+                    [enc setBuffer:g_metal->buf_tq_encode_k  offset:0      atIndex:7];
+                    [enc setBuffer:g_metal->buf_tq_encode_v  offset:0      atIndex:8];
+                    uint32_t cp_zero = 0;
+                    [enc setBytes:&cp_zero length:4 atIndex:15];  // override cache_pos to 0
+                } else {
+                    [enc setBuffer:g_metal->buf_kv_k[fa_idx] offset:0      atIndex:7];
+                    [enc setBuffer:g_metal->buf_kv_v[fa_idx] offset:0      atIndex:8];
+                    [enc setBytes:&cp      length:4 atIndex:15];
+                }
                 [enc setBytes:&nqh     length:4 atIndex:9];
                 [enc setBytes:&nkvh    length:4 atIndex:10];
                 [enc setBytes:&hd      length:4 atIndex:11];
                 [enc setBytes:&rd      length:4 atIndex:12];
                 [enc setBytes:&theta   length:4 atIndex:13];
                 [enc setBytes:&pos32   length:4 atIndex:14];
-                [enc setBytes:&cp      length:4 atIndex:15];
+                if (!tq_fullattn) {
+                    // Non-TQ: cache_pos already set above
+                }
                 [enc setBytes:&kvd     length:4 atIndex:16];
                 [enc setBytes:&norm_eps length:4 atIndex:17];
-                // fp16 KV cache for fused flash-attention
-                if (g_metal->buf_kv_k_f16[fa_idx]) {
+                // fp16 KV cache (non-TQ only; TQ writes to encode scratch instead)
+                if (!tq_fullattn && g_metal->buf_kv_k_f16[fa_idx]) {
                     [enc setBuffer:g_metal->buf_kv_k_f16[fa_idx] offset:0 atIndex:18];
                     [enc setBuffer:g_metal->buf_kv_v_f16[fa_idx] offset:0 atIndex:19];
-                } else {
-                    // Bind dummy buffers (kernel still writes but to same float32 cache)
+                } else if (!tq_fullattn) {
                     [enc setBuffer:g_metal->buf_kv_k[fa_idx]     offset:0 atIndex:18];
                     [enc setBuffer:g_metal->buf_kv_v[fa_idx]     offset:0 atIndex:19];
+                } else {
+                    // TQ: fp16 writes go to encode scratch (already at slots 7/8)
+                    [enc setBuffer:g_metal->buf_tq_encode_k  offset:0 atIndex:18];
+                    [enc setBuffer:g_metal->buf_tq_encode_v  offset:0 atIndex:19];
                 }
                 [enc dispatchThreadgroups:MTLSizeMake(nqh + nkvh, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(HEAD_DIM, 1, 1)];
                 [enc endEncoding];
             }
 
-            // Fused flash-attention (fp16 KV, online softmax, sigmoid gate fused in)
-            // or fallback to 4-kernel pipeline if fp16 KV not available
-            if (g_metal->fused_flash_attn_pipe && g_metal->buf_kv_k_f16[fa_idx]) {
+            // Attention path: TQ fused, flash-attention fp16, or fallback 4-kernel
+            if (tq_fullattn) {
+                // ---- TQ path: Q rotation + tq_pack_update + tq_fused_attention + sigmoid_gate ----
+                uint32_t sl = (uint32_t)(kv->len + 1);  // kv_len after this token
+                uint32_t GPU_TQ_SEQ32 = GPU_TQ_SEQ;
+                uint32_t causal_offset32 = 0;
+
+                // GPU Q rotation: buf_attn_q = buf_attn_q × Pi^T
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->tq_rotate_q_pipe];
+                    [enc setBuffer:g_metal->buf_attn_q   offset:0 atIndex:0];  // in: normed+RoPE'd Q
+                    [enc setBuffer:g_metal->buf_tq_rot   offset:0 atIndex:1];  // Pi matrix
+                    [enc setBuffer:g_metal->buf_attn_q   offset:0 atIndex:2];  // out: rotated Q (in-place)
+                    [enc dispatchThreadgroups:MTLSizeMake(NUM_ATTN_HEADS, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(HEAD_DIM, 1, 1)];
+                    [enc endEncoding];
+                }
+                // tq_pack_update: compress K/V from encode scratch into TQ packed cache
+                {
+                    uint32_t pack_pos = (uint32_t)kv->len;  // current position (before increment)
+                    id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->tq_pack_update_pipe];
+                    [enc setBuffer:g_metal->buf_tq_encode_k         offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_tq_encode_v         offset:0 atIndex:1];
+                    [enc setBuffer:g_metal->buf_tq_rot              offset:0 atIndex:2];
+                    [enc setBuffer:g_metal->buf_tq_k_packed[fa_idx] offset:0 atIndex:3];
+                    [enc setBuffer:g_metal->buf_tq_k_norms[fa_idx]  offset:0 atIndex:4];
+                    [enc setBuffer:g_metal->buf_tq_v_packed[fa_idx] offset:0 atIndex:5];
+                    [enc setBuffer:g_metal->buf_tq_v_norms[fa_idx]  offset:0 atIndex:6];
+                    [enc setBytes:&pack_pos      length:4 atIndex:7];
+                    [enc setBytes:&GPU_TQ_SEQ32  length:4 atIndex:8];
+                    [enc dispatchThreadgroups:MTLSizeMake(NUM_KV_HEADS * TQ_WORDS_PER_HEAD, 1, 1)
+                                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    [enc endEncoding];
+                }
+                // tq_fused_attention: compressed attention with online softmax
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->tq_fused_attn_pipe];
+                    [enc setBuffer:g_metal->buf_attn_q                    offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_attn_gate                 offset:0 atIndex:1];
+                    [enc setBuffer:g_metal->buf_tq_k_packed[fa_idx]       offset:0 atIndex:2];
+                    [enc setBuffer:g_metal->buf_tq_k_norms[fa_idx]        offset:0 atIndex:3];
+                    [enc setBuffer:g_metal->buf_tq_v_packed[fa_idx]       offset:0 atIndex:4];
+                    [enc setBuffer:g_metal->buf_tq_v_norms[fa_idx]        offset:0 atIndex:5];
+                    [enc setBuffer:g_metal->buf_tq_rot                    offset:0 atIndex:6];
+                    [enc setBuffer:g_metal->buf_tq_inv_rot                offset:0 atIndex:7];
+                    [enc setBuffer:g_metal->buf_attn_out                  offset:0 atIndex:8];
+                    [enc setBytes:&sl              length:4 atIndex:9];
+                    [enc setBytes:&GPU_TQ_SEQ32    length:4 atIndex:10];
+                    [enc setBytes:&causal_offset32 length:4 atIndex:11];
+                    [enc dispatchThreadgroups:MTLSizeMake(NUM_ATTN_HEADS * 256, 1, 1)
+                              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
+                // sigmoid_gate (tq_fused_attention does NOT include gate)
+                {
+                    uint32_t qdim = (uint32_t)q_dim_l;
+                    id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->sigmoid_gate_pipe];
+                    [enc setBuffer:g_metal->buf_attn_out  offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_attn_gate offset:0 atIndex:1];
+                    [enc setBytes:&qdim length:4 atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake((qdim+255)/256, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
+            } else if (g_metal->fused_flash_attn_pipe && g_metal->buf_kv_k_f16[fa_idx]) {
                 uint32_t sl = (uint32_t)(kv->len + 1);
                 uint32_t kvd = (uint32_t)kv_dim_l;
                 uint32_t hpkv = NUM_ATTN_HEADS / NUM_KV_HEADS;
