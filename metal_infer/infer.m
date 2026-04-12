@@ -9611,32 +9611,26 @@ static void multi_slot_expert_dispatch_batched(
         float *hidden_t = hidden_batch + (size_t)t * HIDDEN_DIM;
         float *expert_out_t = expert_out_batch + (size_t)t * HIDDEN_DIM;
 
-        // Copy shared expert gate/up from per-slot to shared buffers
-        memcpy([ctx->buf_shared_gate contents],
-               [ctx->buf_shared_gate_slot[t] contents], SHARED_INTERMEDIATE * sizeof(float));
-        memcpy([ctx->buf_shared_up contents],
-               [ctx->buf_shared_up_slot[t] contents], SHARED_INTERMEDIATE * sizeof(float));
-
         // Copy h_mid to buf_h_mid_slot[t] for GPU combine
         memcpy([ctx->buf_h_mid_slot[t] contents], hidden_t, HIDDEN_DIM * sizeof(float));
 
         // Copy expert_out to per-slot expert output buf for GPU combine
-        // (moe_combine_residual reads from buf_multi_expert_out_slot[t])
-        // We have the CPU-accumulated expert_out_t — copy it to ONE expert output slot
-        // and set weight=1.0 for that slot (the accumulation already applied gate weights)
         memcpy([ctx->buf_multi_expert_out_slot[t][0] contents],
                expert_out_t, HIDDEN_DIM * sizeof(float));
 
         // GPU CMD3: shared SwiGLU + down + combine + norm → async on queue_slot[t]
+        // CRITICAL: ALL buffers must be PER-SLOT. Concurrent CMD3s on different
+        // queue_slot[t] writing to shared buffers = data race = garbage output.
+        // This was the root cause of T>1 correctness failure.
         id<MTLCommandBuffer> cmd3 = [ctx->queue_slot[t] commandBuffer];
 
-        // Shared SwiGLU
+        // Shared SwiGLU (per-slot buffers)
         {
             id<MTLComputeCommandEncoder> enc = [cmd3 computeCommandEncoder];
             [enc setComputePipelineState:ctx->swiglu];
-            [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_shared_up   offset:0 atIndex:1];
-            [enc setBuffer:ctx->buf_shared_act  offset:0 atIndex:2];
+            [enc setBuffer:ctx->buf_shared_gate_slot[t] offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_shared_up_slot[t]   offset:0 atIndex:1];
+            [enc setBuffer:ctx->buf_shared_act_slot[t]  offset:0 atIndex:2];
             uint32_t dim = SHARED_INTERMEDIATE;
             [enc setBytes:&dim length:4 atIndex:3];
             [enc dispatchThreadgroups:MTLSizeMake((dim + 255) / 256, 1, 1)
@@ -9644,11 +9638,11 @@ static void multi_slot_expert_dispatch_batched(
             [enc endEncoding];
         }
 
-        // Shared down_proj
+        // Shared down_proj (per-slot in/out)
         if (lc->sd_w && lc->sd_s && lc->sd_b) {
             gpu_encode_dequant_matvec_with_io_bufs(
                 ctx, cmd3, lc->sd_w, lc->sd_s, lc->sd_b,
-                ctx->buf_shared_act, ctx->buf_shared_out,
+                ctx->buf_shared_act_slot[t], ctx->buf_shared_out_slot[t],
                 HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
         }
 
@@ -9672,7 +9666,7 @@ static void multi_slot_expert_dispatch_batched(
                 id<MTLComputeCommandEncoder> enc = [cmd3 computeCommandEncoder];
                 [enc setComputePipelineState:ctx->moe_combine_residual];
                 [enc setBuffer:ctx->buf_h_mid_slot[t]      offset:0 atIndex:0];
-                [enc setBuffer:ctx->buf_shared_out         offset:0 atIndex:1];
+                [enc setBuffer:ctx->buf_shared_out_slot[t] offset:0 atIndex:1];
                 [enc setBuffer:ctx->buf_moe_hidden_slot[t] offset:0 atIndex:2];
                 for (int k = 0; k < MAX_K; k++) {
                     [enc setBuffer:ctx->buf_multi_expert_out_slot[t][k] offset:0 atIndex:(3 + k)];
@@ -9761,9 +9755,13 @@ static void multi_slot_expert_dispatch_token(
 
     int actual_K = (K > MAX_K) ? MAX_K : K;
 
-    // Read h_post from buf_input_slot[t] → shared buf_multi_expert_input
-    memcpy([ctx->buf_multi_expert_input contents],
-           [ctx->buf_input_slot[t] contents], HIDDEN_DIM * sizeof(float));
+    // Swap buf_multi_expert_input to point at the PER-SLOT buf_input_slot[t]
+    // which already contains h_post. Metal captures the buffer reference at
+    // ENCODE time (not commit time), so the GPU reads from the per-slot buffer
+    // even after we swap the pointer back for the next token.
+    // This avoids the shared-buffer race without needing synchronous dispatch.
+    id<MTLBuffer> saved_expert_input = ctx->buf_multi_expert_input;
+    ctx->buf_multi_expert_input = ctx->buf_input_slot[t];
 
     // Copy shared expert gate/up from per-slot to shared buffers
     memcpy([ctx->buf_shared_gate contents],
@@ -9846,13 +9844,13 @@ static void multi_slot_expert_dispatch_token(
     // Expert forwards (batched encoding)
     gpu_encode_experts_batched(ctx, cmd3, actual_K, valid, expert_bufs);
 
-    // Shared SwiGLU
+    // Shared SwiGLU (PER-SLOT buffers — concurrent CMD3s on different queues)
     {
         id<MTLComputeCommandEncoder> enc = [cmd3 computeCommandEncoder];
         [enc setComputePipelineState:ctx->swiglu];
-        [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
-        [enc setBuffer:ctx->buf_shared_up   offset:0 atIndex:1];
-        [enc setBuffer:ctx->buf_shared_act  offset:0 atIndex:2];
+        [enc setBuffer:ctx->buf_shared_gate_slot[t] offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_shared_up_slot[t]   offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_shared_act_slot[t]  offset:0 atIndex:2];
         uint32_t dim = SHARED_INTERMEDIATE;
         [enc setBytes:&dim length:4 atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake((dim + 255) / 256, 1, 1)
@@ -9860,17 +9858,17 @@ static void multi_slot_expert_dispatch_token(
         [enc endEncoding];
     }
 
-    // Shared down_proj
+    // Shared down_proj (per-slot in/out)
     if (lc->sd_w && lc->sd_s && lc->sd_b) {
         gpu_encode_dequant_matvec_with_io_bufs(
             ctx, cmd3, lc->sd_w, lc->sd_s, lc->sd_b,
-            ctx->buf_shared_act, ctx->buf_shared_out,
+            ctx->buf_shared_act_slot[t], ctx->buf_shared_out_slot[t],
             HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
     }
 
-    // GPU combine: moe_combine_residual
+    // GPU combine (per-slot buffers throughout)
     if (ctx->moe_combine_residual) {
-        float *params = (float *)[ctx->buf_combine_params contents];
+        float *params = (float *)[ctx->buf_combine_params_slot[t] contents];
         memset(params, 0, 10 * sizeof(float));
         for (int k = 0; k < actual_K; k++) {
             params[k] = valid[k] ? expert_weights[k] : 0.0f;
@@ -9879,13 +9877,13 @@ static void multi_slot_expert_dispatch_token(
 
         id<MTLComputeCommandEncoder> enc = [cmd3 computeCommandEncoder];
         [enc setComputePipelineState:ctx->moe_combine_residual];
-        [enc setBuffer:ctx->buf_h_mid      offset:0 atIndex:0];
-        [enc setBuffer:ctx->buf_shared_out offset:0 atIndex:1];
-        [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:2];
+        [enc setBuffer:ctx->buf_h_mid_slot[t]           offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_shared_out_slot[t]      offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_moe_hidden_slot[t]      offset:0 atIndex:2];
         for (int k = 0; k < MAX_K; k++) {
-            [enc setBuffer:ctx->buf_multi_expert_out[k] offset:0 atIndex:(3 + k)];
+            [enc setBuffer:ctx->buf_multi_expert_out_slot[t][k] offset:0 atIndex:(3 + k)];
         }
-        [enc setBuffer:ctx->buf_combine_params offset:0 atIndex:11];
+        [enc setBuffer:ctx->buf_combine_params_slot[t] offset:0 atIndex:11];
         uint32_t dim = HIDDEN_DIM;
         uint32_t k_val = (uint32_t)actual_K;
         [enc setBytes:&dim   length:4 atIndex:12];
@@ -9983,10 +9981,14 @@ static void multi_slot_expert_dispatch_token(
         [enc endEncoding];
     }
 
-    // ---- ASYNC dispatch on per-slot queue (restores CMD3→CMD1 pipeline) ----
+    // Dispatch CMD3. The last token in the chunk uses ASYNC dispatch on
+    // queue_slot[t] for pipeline overlap with the next layer's CMD1.
+    // All OTHER tokens use SYNC dispatch on the main queue to prevent
+    // shared intermediate buffer races (buf_multi_expert_gate/up/act[k]
+    // and buf_multi_expert_data[k] are shared across concurrent CMD3s).
     [cmd3 commit];
-    // DO NOT wait — CMD3 runs async on queue_slot[t].
-    // The NEXT layer's CMD1 on queue_slot[t] will auto-wait for CMD3 to complete.
+    // Restore shared expert_input pointer
+    ctx->buf_multi_expert_input = saved_expert_input;
 
     // Store deferred state for finalization at the start of the next layer
     g_current_slot = t;
@@ -10116,17 +10118,22 @@ static void multi_slot_prefill_chunk(
 
         double t_attn_done = now_ms();
 
-        // ---- Step 2: Expert dispatch per token — ASYNC on per-slot queues ----
-        // Per-token dispatch with malloc cache is faster than batched
-        // dispatch_experts_sparse (which doesn't use the cache and does
-        // synchronous gpu_expert_forward per pair). Each token's CMD3
-        // goes on queue_slot[t] for pipeline overlap with next layer.
+        // ---- Step 2: Expert dispatch per token ----
+        // Non-last tokens: SYNC dispatch (wait for CMD3) to prevent shared
+        // intermediate buffer races (buf_multi_expert_gate/up/act/data[k]).
+        // Last token: ASYNC (deferred) on queue_slot[T-1] for CMD3→CMD1
+        // pipeline overlap with the next layer.
         for (int t = 0; t < T; t++) {
             multi_slot_expert_dispatch_token(
                 layer,
                 hidden_chunk + (size_t)t * HIDDEN_DIM,
                 t, K, layer_fds[layer],
                 layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL);
+            // Wait for non-last tokens to prevent buffer races
+            if (t < T - 1 && deferred_slot_active(t)) {
+                complete_deferred_slot(t);
+            }
+            // Last token stays deferred for pipeline overlap
         }
 
         double t_expert_done = now_ms();
