@@ -9976,7 +9976,7 @@ static void multi_slot_prefill_chunk(
         sum_expert += (t_expert_done - t_attn_done);
         if (layer == NUM_LAYERS - 1) {
             chunk_count++;
-            if (chunk_count <= 5) {
+            if (ms_dbg || chunk_count <= 10 || chunk_count % 5 == 0) {
                 fprintf(stderr, "[MS-CHUNK] chunk=%d sum_attn=%.1f sum_expert=%.1f total=%.1f ms (%.1f ms/tok at T=%d)\n",
                         chunk_count, sum_attn, sum_expert, sum_attn + sum_expert,
                         (sum_attn + sum_expert) / T, T);
