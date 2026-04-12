@@ -7,6 +7,11 @@ metal_infer/bench_pread
 *.air
 *.metallib
 
+# ANE bench artifacts (mlmodelc bundles are 400+ MB and rebuildable from anemll-qwen35)
+ane_bench/ane_*_bench
+ane_bench/*.mlmodelc/
+ane_bench/*.mlpackage/
+
 # Generated model files (recreate with scripts — see CLAUDE.md Quick Start)
 metal_infer/model_weights.bin
 metal_infer/model_weights.json
