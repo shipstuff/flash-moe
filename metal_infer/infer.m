@@ -4202,7 +4202,14 @@ typedef struct {
     int layer_idx;                      // which layer produced this deferred state
 } DeferredExpertState;
 
-static DeferredExpertState g_deferred = { .active = 0 };
+// Multi-slot deferred state: array of MAX_MULTI_T slots.
+// The `g_deferred` macro routes to the current active slot so that ALL
+// existing code that uses `g_deferred.xxx` works unchanged.
+// The multi-slot prefill driver sets g_current_slot before each slot's
+// operation to route the deferred state to the right slot.
+static DeferredExpertState g_deferred_slots[MAX_MULTI_T] = {{ .active = 0 }};
+static int g_current_slot = 0;
+#define g_deferred g_deferred_slots[g_current_slot]
 
 // Wait for the deferred GPU expert command buffer to complete.
 // Split from finalize so timing can be measured independently.
@@ -4275,6 +4282,28 @@ static void discard_deferred_experts(void) {
         g_deferred.gpu_combined = 0;
         g_deferred.cmd_experts = nil;
     }
+}
+
+// ---- Per-slot deferred helpers for the multi-slot prefill driver ----
+// These temporarily switch g_current_slot, call the existing helper, then
+// restore. The existing code (which uses the g_deferred macro) sees the
+// right slot's state automatically.
+static void complete_deferred_slot(int slot) {
+    int saved = g_current_slot;
+    g_current_slot = slot;
+    complete_deferred_experts();
+    g_current_slot = saved;
+}
+
+static void discard_deferred_slot(int slot) {
+    int saved = g_current_slot;
+    g_current_slot = slot;
+    discard_deferred_experts();
+    g_current_slot = saved;
+}
+
+static int deferred_slot_active(int slot) {
+    return g_deferred_slots[slot].active;
 }
 
 // ============================================================================
