@@ -42,9 +42,10 @@ int main(int argc, const char *argv[]) {
         //                 signature (9 inputs).
         const char *path = (argc >= 2 && argv[1][0] != '-') ? argv[1]
             : "/Users/carl/projects/turbomoe/flash_moe/ane_bench/superblock0.mlmodelc";
-        int fm_linear = 0;
+        int fm_linear = 0, fm_bundle4 = 0;
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--fm-linear") == 0) fm_linear = 1;
+            else if (strcmp(argv[i], "--fm-bundle4") == 0) fm_bundle4 = 1;
         }
         NSURL *url = [NSURL fileURLWithPath:@(path)];
 
@@ -76,7 +77,19 @@ int main(int argc, const char *argv[]) {
             inputs[@name] = __a; \
         } while(0)
 
-        if (fm_linear) {
+        if (fm_bundle4) {
+            // flash_moe 4-layer linear bundle: Hv=64, conv_dim=12288, 4 state pairs
+            printf("Input signature: flash_moe 4-layer linear bundle\n");
+            MK("hidden_states", @1, @1, @4096);
+            MK("gated_state_0", @1, @64, @128, @128);
+            MK("conv_state_0",  @1, @3, @12288);
+            MK("gated_state_1", @1, @64, @128, @128);
+            MK("conv_state_1",  @1, @3, @12288);
+            MK("gated_state_2", @1, @64, @128, @128);
+            MK("conv_state_2",  @1, @3, @12288);
+            MK("gated_state_3", @1, @64, @128, @128);
+            MK("conv_state_3",  @1, @3, @12288);
+        } else if (fm_linear) {
             // flash_moe single linear layer: Hv=64, conv_dim=12288
             printf("Input signature: flash_moe single linear layer\n");
             MK("hidden_states", @1, @1, @4096);
@@ -162,7 +175,19 @@ int main(int argc, const char *argv[]) {
         printf("    max:  %.3f ms\n", sorted[N - 1]);
         printf("    mean: %.3f ms\n", mean);
 
-        if (fm_linear) {
+        if (fm_bundle4) {
+            double per_layer = sorted[N/2] / 4.0;
+            printf("\n=== flash_moe 4-layer bundle extrapolation ===\n");
+            printf("  4 linear layers per call, %.3f ms per call (p50)\n", sorted[N/2]);
+            printf("  Effective per-layer: %.3f ms\n", per_layer);
+            printf("  For 45 total linear layers (≈ 12 bundles + 3 tail layers):\n");
+            printf("    12 × p50 + 3 × per_layer = %.1f ms/token on ANE\n",
+                   12.0 * sorted[N/2] + 3.0 * per_layer);
+            printf("  For 15 DDDA super-blocks (45 linear + 15 full-attn):\n");
+            printf("    15 × p50 (if full-attn matches linear cost) = %.1f ms/token\n",
+                   15.0 * sorted[N/2]);
+            printf("  Current warm-cache baseline: ~150 ms/token (full stack).\n");
+        } else if (fm_linear) {
             printf("\n=== flash_moe extrapolation ===\n");
             printf("  This is ONE linear layer (unbundled). flash_moe has 45 such layers\n");
             printf("  per token (interspersed with 15 full-attention layers).\n");
