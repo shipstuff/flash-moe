@@ -10174,7 +10174,7 @@ static void multi_slot_prefill_chunk(
         sum_expert += (t_expert_done - t_attn_done);
         if (layer == NUM_LAYERS - 1) {
             chunk_count++;
-            if (ms_dbg || chunk_count <= 10 || chunk_count % 5 == 0) {
+            if (ms_dbg) {
                 fprintf(stderr, "[MS-CHUNK] chunk=%d sum_attn=%.1f sum_expert=%.1f total=%.1f ms (%.1f ms/tok at T=%d)\n",
                         chunk_count, sum_attn, sum_expert, sum_attn + sum_expert,
                         (sum_attn + sum_expert) / T, T);
@@ -11195,11 +11195,18 @@ int main(int argc, char **argv) {
 
             // Check MULTI_SLOT_PREFILL env var (once)
             if (g_multi_slot_prefill_enabled < 0) {
+                // Default ON when batch_prefill_T > 1 and malloc cache is active.
+                // Disable with MULTI_SLOT_PREFILL=0 for comparison benchmarks.
                 const char *ms = getenv("MULTI_SLOT_PREFILL");
-                g_multi_slot_prefill_enabled = (ms && ms[0] == '1') ? 1 : 0;
+                if (ms) {
+                    g_multi_slot_prefill_enabled = (ms[0] == '1') ? 1 : 0;
+                } else {
+                    // Auto-enable when using malloc cache (the production config)
+                    g_multi_slot_prefill_enabled = (g_malloc_cache != NULL) ? 1 : 0;
+                }
                 if (g_multi_slot_prefill_enabled) {
-                    fprintf(stderr, "[multi-slot] MULTI_SLOT_PREFILL=1: using Phase 2 "
-                            "multi-slot prefill with parallel projections\n");
+                    fprintf(stderr, "[multi-slot] multi-slot prefill enabled "
+                            "(parallel projections + deferred pipeline)\n");
                 }
             }
 

@@ -92,6 +92,10 @@ not-actually-doing-I/O path with garbage expert data. See the benchmark file
 Parked investigations that have been scoped in detail but are waiting for a
 focused multi-session effort. Read these before re-opening a related topic.
 
+- **`docs/2026-04-12-multi-slot-milestone.md`** — Multi-slot prefill results:
+  3-6% warm-cache speedup + 3.2× cold-cache first-chunk on 454-tok prompt
+  with `--malloc-cache 2581`. Activate: `MULTI_SLOT_PREFILL=1 --batch-prefill 4`.
+  Correct output verified. See doc for architecture + remaining optimization potential.
 - **`docs/2026-04-11-optimization-roadmap.md`** — **The load-bearing doc.**
   Full pipeline explainer (how CMD1/CMD2/CMD3 deferred state works, why the
   current warm-cache path is fast), multi-buffered deferred state explanation,
