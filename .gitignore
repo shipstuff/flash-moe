@@ -40,6 +40,15 @@ logs/
 metal_infer/test_lzfse
 metal_infer/repack_experts_lz4
 metal_infer/routing_data.bin
+
+# Local tool state and rebuildable debug outputs
+.claude/
+metal_infer/infer.dSYM/
+metal_infer/infer_batch_test
+metal_infer/infer_omp_on
+metal_infer/output
+metal_infer/packed_experts
+
 # Stale files
 metal_infer/infer.m.bak*
 metal_infer/infer.m.debug_backup
